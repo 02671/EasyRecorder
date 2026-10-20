@@ -2,6 +2,13 @@
 .claude
 .gemini
 .opencode
+.monkeycode
+
+# Build output
+**/bin/
+**/obj/
+artifacts/
+EasyRecorder/dist/*.exe
 
 # IDE and Editors
 **/.idea/
