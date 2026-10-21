@@ -136,12 +136,6 @@ public sealed class MainForm : Form
         };
 
         SetIdleUi();
-
-        string? ffmpeg = FfmpegLocator.Find(_settings);
-        if (!string.IsNullOrWhiteSpace(ffmpeg))
-        {
-            Task.Run(() => FfmpegLocator.Warmup(ffmpeg));
-        }
     }
 
     private void BuildLayout()
@@ -225,9 +219,24 @@ public sealed class MainForm : Form
             PositionAtTop();
             Opacity = 1;
             NativeMethods.SetWindowDisplayAffinity(Handle, NativeMethods.WDA_EXCLUDEFROMCAPTURE);
+            PrepareEncoder();
             ShowWelcomeOnce();
             _uiTimer.Start();
         }
+    }
+
+    private void PrepareEncoder()
+    {
+        string? ffmpeg = FfmpegLocator.Find(_settings);
+        if (string.IsNullOrWhiteSpace(ffmpeg))
+        {
+            return;
+        }
+
+        Rectangle region = _customRegion && _region.Width >= 16
+            ? _region
+            : Recorder.PrimaryScreenRegion();
+        _ = _recorder.PrepareAsync(ffmpeg, region, _settings.AudioMode);
     }
 
     private void PositionAtTop()
@@ -312,6 +321,7 @@ public sealed class MainForm : Form
             PlaceNearRegion(_region);
             _regionBorder.ShowAround(_region);
             SetIdleUi();
+            PrepareEncoder();
         }
         else
         {
@@ -516,6 +526,7 @@ public sealed class MainForm : Form
         {
             options.ApplyTo(_settings);
             _settings.Save();
+            PrepareEncoder();
         }
     }
 

@@ -1,9 +1,7 @@
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Imaging;
-using System.IO.Pipes;
 using System.Runtime.InteropServices;
-using System.Text;
 using System.Windows.Forms;
 using NAudio.CoreAudioApi;
 using NAudio.Wave;
@@ -14,34 +12,35 @@ public sealed class Recorder : IDisposable
 {
     private const int FramesPerSecond = 30;
 
+    private readonly object _sessionGate = new();
     private readonly object _audioGate = new();
-    private readonly object _logGate = new();
     private readonly object _stopGate = new();
     private readonly Stopwatch _clock = new();
+    private readonly ManualResetEventSlim _streamsGo = new(false);
 
-    private Process? _ffmpeg;
-    private Thread? _videoThread;
-    private Thread? _audioInitThread;
-    private Thread? _audioWriteThread;
-    private NamedPipeServerStream? _audioPipe;
+    private FfmpegSession? _standby;
+    private FfmpegSession? _active;
+    private Task? _prepareTask;
+    private CancellationTokenSource? _prepareCts;
+    private Task? _videoTask;
+    private Task? _audioWriteTask;
+    private Task? _audioInitTask;
     private LiveAudioMixer? _mixer;
     private DxgiScreenCapture? _dxgi;
+    private WasapiLoopbackCapture? _systemCapture;
+    private WasapiCapture? _microphoneCapture;
     private volatile bool _stopRequested;
     private volatile bool _paused;
     private volatile bool _acceptAudio;
     private volatile bool _audioAbandoned;
     private Rectangle _region;
-    private string _tempDirectory = string.Empty;
-    private string _outputPath = string.Empty;
     private string _outputFolder = string.Empty;
-    private WasapiLoopbackCapture? _systemCapture;
-    private WasapiCapture? _microphoneCapture;
-    private readonly StringBuilder _ffmpegLog = new();
     private string? _captureError;
     private AudioMode _audioMode;
     private DateTime _startedAt;
     private bool _disposed;
     private bool _includeAudio;
+    private string _ffmpegPath = string.Empty;
 
     public bool IsRecording { get; private set; }
     public bool IsPaused => _paused;
@@ -50,6 +49,43 @@ public sealed class Recorder : IDisposable
 
     public event Action<string>? WarningRaised;
 
+    public Task PrepareAsync(string ffmpegPath, Rectangle region, AudioMode audioMode)
+    {
+        if (_disposed || string.IsNullOrWhiteSpace(ffmpegPath))
+        {
+            return Task.CompletedTask;
+        }
+
+        Rectangle prepared = NormalizeRegion(region);
+        Size size = prepared.Size;
+        bool includeAudio = audioMode != AudioMode.None;
+
+        _ffmpegPath = ffmpegPath;
+        _audioMode = audioMode;
+        _region = prepared;
+
+        lock (_sessionGate)
+        {
+            if (IsRecording)
+            {
+                return Task.CompletedTask;
+            }
+
+            if (_standby is { IsAlive: true, IsReady: true } && _standby.Matches(size, includeAudio))
+            {
+                return Task.CompletedTask;
+            }
+
+            _prepareCts?.Cancel();
+            _prepareCts?.Dispose();
+            _prepareCts = new CancellationTokenSource();
+            CancellationToken token = _prepareCts.Token;
+            string path = ffmpegPath;
+            _prepareTask = Task.Run(() => ReplaceStandbyAsync(path, size, includeAudio, token), token);
+            return _prepareTask;
+        }
+    }
+
     public async Task StartAsync(Rectangle region, string ffmpegPath, string outputFolder, AudioMode audioMode)
     {
         if (IsRecording)
@@ -57,16 +93,12 @@ public sealed class Recorder : IDisposable
             return;
         }
 
-        await Task.Run(() => StartCore(region, ffmpegPath, outputFolder, audioMode));
+        await StartCoreAsync(region, ffmpegPath, outputFolder, audioMode).ConfigureAwait(false);
     }
 
-    private void StartCore(Rectangle region, string ffmpegPath, string outputFolder, AudioMode audioMode)
+    private async Task StartCoreAsync(Rectangle region, string ffmpegPath, string outputFolder, AudioMode audioMode)
     {
-        Rectangle screen = SystemInformation.VirtualScreen;
-        region.Intersect(screen);
-        region.Width -= region.Width % 2;
-        region.Height -= region.Height % 2;
-
+        region = NormalizeRegion(region);
         if (region.Width < 16 || region.Height < 16)
         {
             throw new InvalidOperationException("录制区域太小，请重新框选。");
@@ -76,10 +108,8 @@ public sealed class Recorder : IDisposable
         _region = region;
         _audioMode = audioMode;
         _outputFolder = outputFolder;
+        _ffmpegPath = ffmpegPath;
         _startedAt = DateTime.Now;
-        _tempDirectory = Path.Combine(Path.GetTempPath(), "EasyRecorder", Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(_tempDirectory);
-        _outputPath = Path.Combine(_tempDirectory, "recording.mp4");
         _captureError = null;
         Warning = null;
         _stopRequested = false;
@@ -87,170 +117,111 @@ public sealed class Recorder : IDisposable
         _acceptAudio = false;
         _includeAudio = audioMode != AudioMode.None;
         _clock.Reset();
-        lock (_logGate)
-        {
-            _ffmpegLog.Clear();
-        }
+        _streamsGo.Reset();
 
+        FfmpegSession session;
         try
         {
+            session = await TakeOrCreateSessionAsync(ffmpegPath, region.Size, _includeAudio).ConfigureAwait(false);
+            _active = session;
             _dxgi = DxgiScreenCapture.TryCreate(_region);
-            string? audioPipePath = null;
             if (_includeAudio)
             {
                 _mixer = new LiveAudioMixer();
-                audioPipePath = CreateAudioPipe();
                 StartAudioCapture();
-                _audioWriteThread = new Thread(AudioWriteLoop)
-                {
-                    IsBackground = true,
-                    Name = "EasyRecorder.AudioWrite"
-                };
-                _audioWriteThread.Start();
             }
 
-            StartVideoProcess(ffmpegPath, audioPipePath);
-            _videoThread = new Thread(VideoLoop)
+            _videoTask = Task.Run(VideoLoopAsync);
+            if (_includeAudio)
             {
-                IsBackground = true,
-                Name = "EasyRecorder.Video"
-            };
-            _videoThread.Start();
+                _audioWriteTask = Task.Run(AudioWriteLoopAsync);
+            }
 
             _clock.Start();
+            _streamsGo.Set();
             IsRecording = true;
         }
         catch
         {
-            CleanupProcess();
-            CleanupAudio();
-            _dxgi?.Dispose();
-            _dxgi = null;
-            TryDeleteDirectory(_tempDirectory);
+            _streamsGo.Set();
+            await AbortStartAsync().ConfigureAwait(false);
             throw;
         }
     }
 
-    private string CreateAudioPipe()
+    private async Task<FfmpegSession> TakeOrCreateSessionAsync(string ffmpegPath, Size size, bool includeAudio)
     {
-        string pipeName = "EasyRecorderAudio_" + Guid.NewGuid().ToString("N");
-        _audioPipe = new NamedPipeServerStream(
-            pipeName,
-            PipeDirection.Out,
-            1,
-            PipeTransmissionMode.Byte,
-            PipeOptions.Asynchronous,
-            65536,
-            65536);
-        return @"\\.\pipe\" + pipeName;
+        Task? pending;
+        lock (_sessionGate)
+        {
+            pending = _prepareTask;
+        }
+
+        if (pending != null)
+        {
+            try
+            {
+                await pending.ConfigureAwait(false);
+            }
+            catch
+            {
+            }
+        }
+
+        lock (_sessionGate)
+        {
+            FfmpegSession? standby = _standby;
+            if (standby != null && standby.IsAlive && standby.IsReady && standby.Matches(size, includeAudio))
+            {
+                _standby = null;
+                return standby;
+            }
+
+            DiscardStandbyLocked();
+        }
+
+        return await FfmpegSession.StartAsync(ffmpegPath, size, includeAudio, CancellationToken.None).ConfigureAwait(false);
     }
 
-    private void StartVideoProcess(string ffmpegPath, string? audioPipePath)
+    private async Task ReplaceStandbyAsync(string ffmpegPath, Size size, bool includeAudio, CancellationToken token)
     {
-        ProcessStartInfo info = new(ffmpegPath)
+        FfmpegSession session = await FfmpegSession.StartAsync(ffmpegPath, size, includeAudio, token).ConfigureAwait(false);
+        lock (_sessionGate)
         {
-            UseShellExecute = false,
-            CreateNoWindow = true,
-            RedirectStandardInput = true,
-            RedirectStandardError = true,
-            RedirectStandardOutput = false,
-            StandardErrorEncoding = Encoding.UTF8
-        };
-
-        info.ArgumentList.Add("-hide_banner");
-        info.ArgumentList.Add("-loglevel");
-        info.ArgumentList.Add("error");
-        info.ArgumentList.Add("-thread_queue_size");
-        info.ArgumentList.Add("512");
-        info.ArgumentList.Add("-f");
-        info.ArgumentList.Add("rawvideo");
-        info.ArgumentList.Add("-pix_fmt");
-        info.ArgumentList.Add("bgra");
-        info.ArgumentList.Add("-s");
-        info.ArgumentList.Add($"{_region.Width}x{_region.Height}");
-        info.ArgumentList.Add("-r");
-        info.ArgumentList.Add(FramesPerSecond.ToString());
-        info.ArgumentList.Add("-i");
-        info.ArgumentList.Add("pipe:0");
-
-        if (audioPipePath != null)
-        {
-            info.ArgumentList.Add("-thread_queue_size");
-            info.ArgumentList.Add("512");
-            info.ArgumentList.Add("-f");
-            info.ArgumentList.Add("s16le");
-            info.ArgumentList.Add("-ar");
-            info.ArgumentList.Add(LiveAudioMixer.SampleRate.ToString());
-            info.ArgumentList.Add("-ac");
-            info.ArgumentList.Add(LiveAudioMixer.Channels.ToString());
-            info.ArgumentList.Add("-i");
-            info.ArgumentList.Add(audioPipePath);
-        }
-
-        info.ArgumentList.Add("-c:v");
-        info.ArgumentList.Add("libx264");
-        info.ArgumentList.Add("-preset");
-        info.ArgumentList.Add("ultrafast");
-        info.ArgumentList.Add("-crf");
-        info.ArgumentList.Add("20");
-        info.ArgumentList.Add("-pix_fmt");
-        info.ArgumentList.Add("yuv420p");
-        if (_includeAudio)
-        {
-            info.ArgumentList.Add("-c:a");
-            info.ArgumentList.Add("aac");
-            info.ArgumentList.Add("-b:a");
-            info.ArgumentList.Add("192k");
-            info.ArgumentList.Add("-ar");
-            info.ArgumentList.Add("48000");
-            info.ArgumentList.Add("-ac");
-            info.ArgumentList.Add("2");
-        }
-        else
-        {
-            info.ArgumentList.Add("-an");
-        }
-
-        info.ArgumentList.Add("-movflags");
-        info.ArgumentList.Add("+faststart");
-        info.ArgumentList.Add("-y");
-        info.ArgumentList.Add(_outputPath);
-
-        _ffmpeg = new Process { StartInfo = info };
-        _ffmpeg.ErrorDataReceived += (_, args) =>
-        {
-            if (string.IsNullOrWhiteSpace(args.Data))
+            if (token.IsCancellationRequested || _disposed || IsRecording)
             {
+                session.Dispose();
+                TryDeleteDirectory(session.TempDirectory);
                 return;
             }
 
-            lock (_logGate)
-            {
-                if (_ffmpegLog.Length < 30000)
-                {
-                    _ffmpegLog.AppendLine(args.Data);
-                }
-            }
-        };
+            DiscardStandbyLocked();
+            _standby = session;
+        }
+    }
 
-        if (!_ffmpeg.Start())
+    private void DiscardStandbyLocked()
+    {
+        FfmpegSession? old = _standby;
+        _standby = null;
+        if (old == null)
         {
-            throw new InvalidOperationException("无法启动 FFmpeg。");
+            return;
         }
 
-        _ffmpeg.BeginErrorReadLine();
+        Task.Run(() =>
+        {
+            string temp = old.TempDirectory;
+            old.Dispose();
+            TryDeleteDirectory(temp);
+        });
     }
 
     private void StartAudioCapture()
     {
         _audioAbandoned = false;
         _acceptAudio = true;
-        _audioInitThread = new Thread(InitializeAudio)
-        {
-            IsBackground = true,
-            Name = "EasyRecorder.AudioInit"
-        };
-        _audioInitThread.Start();
+        _audioInitTask = Task.Run(InitializeAudio);
     }
 
     private void InitializeAudio()
@@ -354,8 +325,17 @@ public sealed class Recorder : IDisposable
         _clock.Start();
     }
 
-    private void VideoLoop()
+    private async Task VideoLoopAsync()
     {
+        _streamsGo.Wait();
+        FfmpegSession? session = _active;
+        Stream? stream = session?.VideoStream;
+        if (session == null || stream == null)
+        {
+            _captureError = "视频管道未就绪。";
+            return;
+        }
+
         try
         {
             int width = _region.Width;
@@ -365,45 +345,18 @@ public sealed class Recorder : IDisposable
 
             using Bitmap bitmap = new(width, height, PixelFormat.Format32bppArgb);
             using Graphics graphics = Graphics.FromImage(bitmap);
-            Stream? stdin = null;
 
             long produced = 0;
             while (!_stopRequested)
             {
                 if (_paused)
                 {
-                    Thread.Sleep(10);
+                    await Task.Delay(10).ConfigureAwait(false);
                     continue;
                 }
 
                 CaptureFrame(bitmap, graphics);
-
-                BitmapData data = bitmap.LockBits(
-                    new Rectangle(0, 0, width, height),
-                    ImageLockMode.ReadOnly,
-                    PixelFormat.Format32bppArgb);
-                try
-                {
-                    if (data.Stride == rowBytes)
-                    {
-                        Marshal.Copy(data.Scan0, buffer, 0, buffer.Length);
-                    }
-                    else
-                    {
-                        IntPtr top = data.Stride > 0
-                            ? data.Scan0
-                            : data.Scan0 + data.Stride * (height - 1);
-                        for (int y = 0; y < height; y++)
-                        {
-                            IntPtr source = top + y * data.Stride;
-                            Marshal.Copy(source, buffer, y * rowBytes, rowBytes);
-                        }
-                    }
-                }
-                finally
-                {
-                    bitmap.UnlockBits(data);
-                }
+                CopyBitmap(bitmap, buffer, width, height, rowBytes);
 
                 long target = (long)(_clock.Elapsed.TotalMilliseconds * FramesPerSecond / 1000.0);
                 if (target - produced > FramesPerSecond)
@@ -411,36 +364,56 @@ public sealed class Recorder : IDisposable
                     produced = target;
                 }
 
-                try
+                while (produced < target && !_stopRequested)
                 {
-                    stdin ??= _ffmpeg!.StandardInput.BaseStream;
-                    while (produced < target && !_stopRequested)
-                    {
-                        stdin.Write(buffer, 0, buffer.Length);
-                        produced++;
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _captureError = "视频写入失败：" + ex.Message;
-                    break;
+                    await stream.WriteAsync(buffer.AsMemory(0, buffer.Length)).ConfigureAwait(false);
+                    produced++;
                 }
 
                 long nextDue = (produced + 1) * 1000 / FramesPerSecond;
                 int wait = (int)(nextDue - _clock.Elapsed.TotalMilliseconds);
                 if (wait > 2)
                 {
-                    Thread.Sleep(wait);
-                }
-                else
-                {
-                    Thread.Sleep(1);
+                    await Task.Delay(wait).ConfigureAwait(false);
                 }
             }
         }
         catch (Exception ex)
         {
-            _captureError = "屏幕采集失败：" + ex.Message;
+            if (!_stopRequested)
+            {
+                _captureError = "视频写入失败：" + ex.Message;
+            }
+        }
+    }
+
+    private static void CopyBitmap(Bitmap bitmap, byte[] buffer, int width, int height, int rowBytes)
+    {
+        BitmapData data = bitmap.LockBits(
+            new Rectangle(0, 0, width, height),
+            ImageLockMode.ReadOnly,
+            PixelFormat.Format32bppArgb);
+        try
+        {
+            if (data.Stride == rowBytes)
+            {
+                Marshal.Copy(data.Scan0, buffer, 0, buffer.Length);
+            }
+            else
+            {
+                IntPtr top = data.Stride > 0
+                    ? data.Scan0
+                    : data.Scan0 + data.Stride * (height - 1);
+                for (int y = 0; y < height; y++)
+                {
+                    IntPtr source = top + y * data.Stride;
+                    Marshal.Copy(source, buffer, y * rowBytes, rowBytes);
+                }
+            }
+        }
+        finally
+        {
+            bitmap.UnlockBits(data);
         }
     }
 
@@ -485,23 +458,14 @@ public sealed class Recorder : IDisposable
         DrawCursor(graphics, _region.Location);
     }
 
-    private void AudioWriteLoop()
+    private async Task AudioWriteLoopAsync()
     {
-        NamedPipeServerStream? pipe = _audioPipe;
+        _streamsGo.Wait();
+        FfmpegSession? session = _active;
+        Stream? stream = session?.AudioStream;
         LiveAudioMixer? mixer = _mixer;
-        if (pipe == null || mixer == null)
+        if (session == null || stream == null || mixer == null)
         {
-            return;
-        }
-
-        try
-        {
-            using CancellationTokenSource timeout = new(TimeSpan.FromSeconds(15));
-            pipe.WaitForConnectionAsync(timeout.Token).GetAwaiter().GetResult();
-        }
-        catch
-        {
-            SetWarning("声音管道未能接通，本次将保存为无声视频。");
             return;
         }
 
@@ -513,28 +477,20 @@ public sealed class Recorder : IDisposable
             {
                 if (_paused)
                 {
-                    Thread.Sleep(10);
+                    await Task.Delay(10).ConfigureAwait(false);
                     continue;
                 }
 
                 mixer.Read(chunk, 0, chunk.Length);
-                pipe.Write(chunk, 0, chunk.Length);
+                await stream.WriteAsync(chunk.AsMemory(0, chunk.Length)).ConfigureAwait(false);
                 produced++;
 
                 long nextDue = produced * LiveAudioMixer.ChunkMilliseconds;
                 int wait = (int)(nextDue - _clock.Elapsed.TotalMilliseconds);
                 if (wait > 2)
                 {
-                    Thread.Sleep(wait);
+                    await Task.Delay(wait).ConfigureAwait(false);
                 }
-            }
-
-            try
-            {
-                pipe.Flush();
-            }
-            catch
-            {
             }
         }
         catch
@@ -612,29 +568,54 @@ public sealed class Recorder : IDisposable
 
         _clock.Stop();
         _stopRequested = true;
+        _streamsGo.Set();
 
-        Thread? videoThread = _videoThread;
-        if (videoThread != null)
+        await WaitQuietly(_videoTask, 4000).ConfigureAwait(false);
+        await StopAudioCaptureAsync().ConfigureAwait(false);
+
+        FfmpegSession? session = _active;
+        _active = null;
+        if (session != null)
         {
-            videoThread.Join(4000);
+            await session.FinishAsync().ConfigureAwait(false);
         }
 
-        StopAudioCapture();
-        ClosePipes();
-
-        await Task.Run(CloseVideoProcess);
-
-        if (discard)
+        string? path = null;
+        try
         {
-            Cleanup();
-            return null;
+            if (!discard)
+            {
+                path = CollectOutput(session);
+            }
+        }
+        finally
+        {
+            CleanupCapture();
+            if (session != null)
+            {
+                string temp = session.TempDirectory;
+                session.Dispose();
+                if (discard)
+                {
+                    TryDeleteDirectory(temp);
+                }
+                else
+                {
+                    TryDeleteDirectory(temp);
+                }
+            }
         }
 
+        SpawnStandby();
+        return path;
+    }
+
+    private string CollectOutput(FfmpegSession? session)
+    {
         string? videoError = _captureError;
-        if (!File.Exists(_outputPath) || new FileInfo(_outputPath).Length == 0)
+        if (session == null || !File.Exists(session.OutputPath) || new FileInfo(session.OutputPath).Length == 0)
         {
-            string log = GetFfmpegLog();
-            Cleanup();
+            string log = session?.GetLog() ?? string.Empty;
             throw new InvalidOperationException(
                 "录像没有成功生成。" +
                 (videoError != null ? "\n\n" + videoError : string.Empty) +
@@ -643,9 +624,19 @@ public sealed class Recorder : IDisposable
 
         Directory.CreateDirectory(_outputFolder);
         string finalPath = GetPlannedOutputPath();
-        File.Move(_outputPath, finalPath, true);
-        Cleanup();
+        File.Move(session.OutputPath, finalPath, true);
         return finalPath;
+    }
+
+    private void SpawnStandby()
+    {
+        if (_disposed || string.IsNullOrWhiteSpace(_ffmpegPath))
+        {
+            return;
+        }
+
+        Rectangle region = _region.Width >= 16 ? _region : PrimaryScreenRegion();
+        _ = PrepareAsync(_ffmpegPath, region, _audioMode);
     }
 
     private string GetPlannedOutputPath()
@@ -666,162 +657,59 @@ public sealed class Recorder : IDisposable
         return candidate;
     }
 
-    private void StopAudioCapture()
+    private async Task StopAudioCaptureAsync()
     {
         _acceptAudio = false;
         _audioAbandoned = true;
+        await WaitQuietly(_audioInitTask, 3000).ConfigureAwait(false);
+        _audioInitTask = null;
 
-        Thread? initThread = _audioInitThread;
-        if (initThread != null && initThread.IsAlive)
-        {
-            initThread.Join(3000);
-        }
+        try { _systemCapture?.StopRecording(); } catch { }
+        try { _microphoneCapture?.StopRecording(); } catch { }
 
-        _audioInitThread = null;
+        await WaitQuietly(_audioWriteTask, 3000).ConfigureAwait(false);
+        _audioWriteTask = null;
 
-        try
-        {
-            _systemCapture?.StopRecording();
-        }
-        catch
-        {
-        }
-
-        try
-        {
-            _microphoneCapture?.StopRecording();
-        }
-        catch
-        {
-        }
-
-        Thread? writeThread = _audioWriteThread;
-        if (writeThread != null && writeThread.IsAlive)
-        {
-            writeThread.Join(3000);
-        }
-
-        _audioWriteThread = null;
-
-        try
-        {
-            _systemCapture?.Dispose();
-        }
-        catch
-        {
-        }
-
-        try
-        {
-            _microphoneCapture?.Dispose();
-        }
-        catch
-        {
-        }
-
+        try { _systemCapture?.Dispose(); } catch { }
+        try { _microphoneCapture?.Dispose(); } catch { }
         _systemCapture = null;
         _microphoneCapture = null;
     }
 
-    private void ClosePipes()
+    private async Task AbortStartAsync()
     {
-        try
+        _stopRequested = true;
+        _streamsGo.Set();
+        await WaitQuietly(_videoTask, 2000).ConfigureAwait(false);
+        await StopAudioCaptureAsync().ConfigureAwait(false);
+        FfmpegSession? session = _active;
+        _active = null;
+        CleanupCapture();
+        if (session != null)
         {
-            _ffmpeg?.StandardInput.BaseStream.Flush();
-            _ffmpeg?.StandardInput.Close();
-        }
-        catch
-        {
-        }
-
-        try
-        {
-            _audioPipe?.Dispose();
-        }
-        catch
-        {
-        }
-
-        _audioPipe = null;
-    }
-
-    private void CloseVideoProcess()
-    {
-        if (_ffmpeg == null)
-        {
-            return;
-        }
-
-        try
-        {
-            if (!_ffmpeg.WaitForExit(20000))
-            {
-                _ffmpeg.Kill(true);
-                _ffmpeg.WaitForExit(3000);
-            }
-            else
-            {
-                _ffmpeg.WaitForExit();
-            }
-        }
-        catch
-        {
+            string temp = session.TempDirectory;
+            session.Dispose();
+            TryDeleteDirectory(temp);
         }
     }
 
-    private string GetFfmpegLog()
+    private void CleanupCapture()
     {
-        lock (_logGate)
-        {
-            return _ffmpegLog.ToString().Trim();
-        }
-    }
-
-    private void CleanupProcess()
-    {
-        try
-        {
-            if (_ffmpeg != null && !_ffmpeg.HasExited)
-            {
-                _ffmpeg.Kill(true);
-            }
-        }
-        catch
-        {
-        }
-
-        try
-        {
-            _ffmpeg?.Dispose();
-        }
-        catch
-        {
-        }
-
-        _ffmpeg = null;
-        try
-        {
-            _audioPipe?.Dispose();
-        }
-        catch
-        {
-        }
-
-        _audioPipe = null;
+        try { _mixer?.Dispose(); } catch { }
+        _mixer = null;
+        try { _dxgi?.Dispose(); } catch { }
+        _dxgi = null;
+        _paused = false;
+        _clock.Reset();
+        _videoTask = null;
+        _audioWriteTask = null;
     }
 
     private void DisposeSystemAudio()
     {
         lock (_audioGate)
         {
-            try
-            {
-                _systemCapture?.StopRecording();
-            }
-            catch
-            {
-            }
-
+            try { _systemCapture?.StopRecording(); } catch { }
             _systemCapture?.Dispose();
             _systemCapture = null;
         }
@@ -831,55 +719,15 @@ public sealed class Recorder : IDisposable
     {
         lock (_audioGate)
         {
-            try
-            {
-                _microphoneCapture?.StopRecording();
-            }
-            catch
-            {
-            }
-
+            try { _microphoneCapture?.StopRecording(); } catch { }
             _microphoneCapture?.Dispose();
             _microphoneCapture = null;
         }
     }
 
-    private void CleanupAudio()
-    {
-        StopAudioCapture();
-        try
-        {
-            _mixer?.Dispose();
-        }
-        catch
-        {
-        }
-
-        _mixer = null;
-    }
-
-    private void Cleanup()
-    {
-        CleanupProcess();
-        CleanupAudio();
-        try
-        {
-            _dxgi?.Dispose();
-        }
-        catch
-        {
-        }
-
-        _dxgi = null;
-        IsRecording = false;
-        _paused = false;
-        _clock.Reset();
-        TryDeleteDirectory(_tempDirectory);
-    }
-
     private void SetWarning(string message)
     {
-        Warning = AppendWarning(Warning, message);
+        Warning = string.IsNullOrWhiteSpace(Warning) ? message : Warning + "\n" + message;
         try
         {
             WarningRaised?.Invoke(message);
@@ -889,9 +737,35 @@ public sealed class Recorder : IDisposable
         }
     }
 
-    private static string AppendWarning(string? current, string message)
+    private static Rectangle NormalizeRegion(Rectangle region)
     {
-        return string.IsNullOrWhiteSpace(current) ? message : current + "\n" + message;
+        Rectangle screen = SystemInformation.VirtualScreen;
+        region.Intersect(screen);
+        region.Width -= region.Width % 2;
+        region.Height -= region.Height % 2;
+        return region;
+    }
+
+    public static Rectangle PrimaryScreenRegion()
+    {
+        Rectangle bounds = Screen.PrimaryScreen?.Bounds ?? new Rectangle(0, 0, 1280, 720);
+        return NormalizeRegion(new Rectangle(bounds.Left, bounds.Top, bounds.Width, bounds.Height));
+    }
+
+    private static async Task WaitQuietly(Task? task, int milliseconds)
+    {
+        if (task == null)
+        {
+            return;
+        }
+
+        try
+        {
+            await task.WaitAsync(TimeSpan.FromMilliseconds(milliseconds)).ConfigureAwait(false);
+        }
+        catch
+        {
+        }
     }
 
     private static void TryDeleteDirectory(string path)
@@ -917,6 +791,21 @@ public sealed class Recorder : IDisposable
 
         _disposed = true;
         _stopRequested = true;
-        Cleanup();
+        _streamsGo.Set();
+        _prepareCts?.Cancel();
+        try { _prepareTask?.Wait(2000); } catch { }
+        lock (_sessionGate)
+        {
+            DiscardStandbyLocked();
+        }
+
+        FfmpegSession? active = _active;
+        _active = null;
+        active?.Dispose();
+        CleanupCapture();
+        try { _systemCapture?.Dispose(); } catch { }
+        try { _microphoneCapture?.Dispose(); } catch { }
+        _streamsGo.Dispose();
+        _prepareCts?.Dispose();
     }
 }
