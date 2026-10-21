@@ -6,19 +6,22 @@ namespace EasyRecorder;
 
 internal sealed class FfmpegSession : IDisposable
 {
+    private const int StartTimeoutMs = 5000;
+    private const int ExitTimeoutMs = 5000;
+
     private readonly object _logGate = new();
     private readonly StringBuilder _log = new();
     private Process? _process;
-    private NamedPipeServerStream? _videoPipe;
     private NamedPipeServerStream? _audioPipe;
+    private Stream? _videoStream;
     private bool _disposed;
 
     public Size FrameSize { get; }
     public bool IncludeAudio { get; }
     public string OutputPath { get; }
     public string TempDirectory { get; }
-    public Stream? VideoStream => _videoPipe;
-    public Stream? AudioStream => _audioPipe;
+    public Stream? VideoStream => _videoStream;
+    public NamedPipeServerStream? AudioPipe => _audioPipe;
 
     public bool IsAlive
     {
@@ -75,9 +78,6 @@ internal sealed class FfmpegSession : IDisposable
 
     private async Task LaunchAsync(string ffmpegPath, CancellationToken cancellationToken)
     {
-        string videoName = "EasyRecorderVideo_" + Guid.NewGuid().ToString("N");
-        _videoPipe = CreatePipe(videoName);
-
         string? audioName = null;
         if (IncludeAudio)
         {
@@ -89,9 +89,9 @@ internal sealed class FfmpegSession : IDisposable
         {
             UseShellExecute = false,
             CreateNoWindow = true,
+            RedirectStandardInput = true,
             RedirectStandardError = true,
-            RedirectStandardOutput = false,
-            StandardErrorEncoding = Encoding.UTF8
+            RedirectStandardOutput = true
         };
 
         info.ArgumentList.Add("-hide_banner");
@@ -114,14 +114,10 @@ internal sealed class FfmpegSession : IDisposable
         info.ArgumentList.Add("-r");
         info.ArgumentList.Add("30");
         info.ArgumentList.Add("-i");
-        info.ArgumentList.Add(@"\\.\pipe\" + videoName);
+        info.ArgumentList.Add("pipe:0");
 
         if (audioName != null)
         {
-            info.ArgumentList.Add("-probesize");
-            info.ArgumentList.Add("32");
-            info.ArgumentList.Add("-analyzeduration");
-            info.ArgumentList.Add("0");
             info.ArgumentList.Add("-thread_queue_size");
             info.ArgumentList.Add("512");
             info.ArgumentList.Add("-f");
@@ -164,36 +160,29 @@ internal sealed class FfmpegSession : IDisposable
         info.ArgumentList.Add(OutputPath);
 
         _process = new Process { StartInfo = info, EnableRaisingEvents = true };
-        _process.ErrorDataReceived += (_, args) =>
-        {
-            if (string.IsNullOrWhiteSpace(args.Data))
-            {
-                return;
-            }
+        _process.OutputDataReceived += (_, args) => AppendLog(args.Data);
+        _process.ErrorDataReceived += (_, args) => AppendLog(args.Data);
 
-            lock (_logGate)
-            {
-                if (_log.Length < 30000)
-                {
-                    _log.AppendLine(args.Data);
-                }
-            }
-        };
+        using CancellationTokenSource timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(StartTimeoutMs);
 
         if (!_process.Start())
         {
             throw new InvalidOperationException("无法启动 FFmpeg。");
         }
 
+        _process.BeginOutputReadLine();
         _process.BeginErrorReadLine();
+        _videoStream = _process.StandardInput.BaseStream;
 
-        using CancellationTokenSource timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeout.CancelAfter(TimeSpan.FromSeconds(15));
-
-        await _videoPipe.WaitForConnectionAsync(timeout.Token).ConfigureAwait(false);
-        if (_audioPipe != null)
+        try
         {
-            await _audioPipe.WaitForConnectionAsync(timeout.Token).ConfigureAwait(false);
+            await Task.Delay(50, timeout.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            KillProcess();
+            throw new TimeoutException("FFmpeg 启动超时。");
         }
 
         if (!IsAlive)
@@ -204,12 +193,63 @@ internal sealed class FfmpegSession : IDisposable
         IsReady = true;
     }
 
+    public async Task<Stream> WaitForAudioAsync(CancellationToken cancellationToken)
+    {
+        if (_audioPipe == null)
+        {
+            throw new InvalidOperationException("没有音频管道。");
+        }
+
+        if (_audioPipe.IsConnected)
+        {
+            return _audioPipe;
+        }
+
+        using CancellationTokenSource timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(StartTimeoutMs);
+        try
+        {
+            await _audioPipe.WaitForConnectionAsync(timeout.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw new TimeoutException("音频管道连接超时。");
+        }
+
+        return _audioPipe;
+    }
+
     public async Task FinishAsync()
     {
         IsReady = false;
-        await ClosePipeAsync(_videoPipe).ConfigureAwait(false);
-        await ClosePipeAsync(_audioPipe).ConfigureAwait(false);
-        _videoPipe = null;
+
+        try
+        {
+            _videoStream?.Flush();
+            _process?.StandardInput.Close();
+        }
+        catch
+        {
+        }
+
+        _videoStream = null;
+
+        try
+        {
+            if (_audioPipe != null)
+            {
+                if (_audioPipe.IsConnected)
+                {
+                    await _audioPipe.FlushAsync().ConfigureAwait(false);
+                }
+
+                _audioPipe.Dispose();
+            }
+        }
+        catch
+        {
+        }
+
         _audioPipe = null;
 
         Process? process = _process;
@@ -220,22 +260,15 @@ internal sealed class FfmpegSession : IDisposable
 
         try
         {
-            using CancellationTokenSource timeout = new(TimeSpan.FromSeconds(20));
-            await process.WaitForExitAsync(timeout.Token).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException)
-        {
-            try
+            if (!process.WaitForExit(ExitTimeoutMs))
             {
-                process.Kill(true);
-                await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(3)).ConfigureAwait(false);
-            }
-            catch
-            {
+                KillProcess();
+                process.WaitForExit(1000);
             }
         }
         catch
         {
+            KillProcess();
         }
     }
 
@@ -244,6 +277,22 @@ internal sealed class FfmpegSession : IDisposable
         lock (_logGate)
         {
             return _log.ToString().Trim();
+        }
+    }
+
+    private void AppendLog(string? line)
+    {
+        if (string.IsNullOrWhiteSpace(line))
+        {
+            return;
+        }
+
+        lock (_logGate)
+        {
+            if (_log.Length < 30000)
+            {
+                _log.AppendLine(line);
+            }
         }
     }
 
@@ -265,27 +314,14 @@ internal sealed class FfmpegSession : IDisposable
             1024 * 1024);
     }
 
-    private static async Task ClosePipeAsync(NamedPipeServerStream? pipe)
+    private void KillProcess()
     {
-        if (pipe == null)
-        {
-            return;
-        }
-
         try
         {
-            if (pipe.IsConnected)
+            if (_process != null && !_process.HasExited)
             {
-                await pipe.FlushAsync().ConfigureAwait(false);
+                _process.Kill(true);
             }
-        }
-        catch
-        {
-        }
-
-        try
-        {
-            pipe.Dispose();
         }
         catch
         {
@@ -301,17 +337,7 @@ internal sealed class FfmpegSession : IDisposable
 
         _disposed = true;
         IsReady = false;
-
-        try
-        {
-            if (_process != null && !_process.HasExited)
-            {
-                _process.Kill(true);
-            }
-        }
-        catch
-        {
-        }
+        KillProcess();
 
         try
         {
@@ -322,14 +348,7 @@ internal sealed class FfmpegSession : IDisposable
         }
 
         _process = null;
-
-        try
-        {
-            _videoPipe?.Dispose();
-        }
-        catch
-        {
-        }
+        _videoStream = null;
 
         try
         {
@@ -339,7 +358,6 @@ internal sealed class FfmpegSession : IDisposable
         {
         }
 
-        _videoPipe = null;
         _audioPipe = null;
     }
 }

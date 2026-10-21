@@ -78,7 +78,7 @@ public sealed class Recorder : IDisposable
 
             _prepareCts?.Cancel();
             _prepareCts?.Dispose();
-            _prepareCts = new CancellationTokenSource();
+            _prepareCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
             CancellationToken token = _prepareCts.Token;
             string path = ffmpegPath;
             _prepareTask = Task.Run(() => ReplaceStandbyAsync(path, size, includeAudio, token), token);
@@ -122,7 +122,8 @@ public sealed class Recorder : IDisposable
         FfmpegSession session;
         try
         {
-            session = await TakeOrCreateSessionAsync(ffmpegPath, region.Size, _includeAudio).ConfigureAwait(false);
+            using CancellationTokenSource startTimeout = new(TimeSpan.FromSeconds(5));
+            session = await TakeOrCreateSessionAsync(ffmpegPath, region.Size, _includeAudio, startTimeout.Token).ConfigureAwait(false);
             _active = session;
             _dxgi = DxgiScreenCapture.TryCreate(_region);
             if (_includeAudio)
@@ -141,6 +142,12 @@ public sealed class Recorder : IDisposable
             _streamsGo.Set();
             IsRecording = true;
         }
+        catch (OperationCanceledException)
+        {
+            _streamsGo.Set();
+            await AbortStartAsync().ConfigureAwait(false);
+            throw new TimeoutException("FFmpeg 启动超时。");
+        }
         catch
         {
             _streamsGo.Set();
@@ -149,7 +156,11 @@ public sealed class Recorder : IDisposable
         }
     }
 
-    private async Task<FfmpegSession> TakeOrCreateSessionAsync(string ffmpegPath, Size size, bool includeAudio)
+    private async Task<FfmpegSession> TakeOrCreateSessionAsync(
+        string ffmpegPath,
+        Size size,
+        bool includeAudio,
+        CancellationToken cancellationToken)
     {
         Task? pending;
         lock (_sessionGate)
@@ -161,7 +172,7 @@ public sealed class Recorder : IDisposable
         {
             try
             {
-                await pending.ConfigureAwait(false);
+                await pending.WaitAsync(cancellationToken).ConfigureAwait(false);
             }
             catch
             {
@@ -180,7 +191,7 @@ public sealed class Recorder : IDisposable
             DiscardStandbyLocked();
         }
 
-        return await FfmpegSession.StartAsync(ffmpegPath, size, includeAudio, CancellationToken.None).ConfigureAwait(false);
+        return await FfmpegSession.StartAsync(ffmpegPath, size, includeAudio, cancellationToken).ConfigureAwait(false);
     }
 
     private async Task ReplaceStandbyAsync(string ffmpegPath, Size size, bool includeAudio, CancellationToken token)
@@ -366,7 +377,7 @@ public sealed class Recorder : IDisposable
 
                 while (produced < target && !_stopRequested)
                 {
-                    await stream.WriteAsync(buffer.AsMemory(0, buffer.Length)).ConfigureAwait(false);
+                    await WritePipeAsync(stream, buffer, produced == 0).ConfigureAwait(false);
                     produced++;
                 }
 
@@ -460,14 +471,26 @@ public sealed class Recorder : IDisposable
 
     private async Task AudioWriteLoopAsync()
     {
-        _streamsGo.Wait();
         FfmpegSession? session = _active;
-        Stream? stream = session?.AudioStream;
         LiveAudioMixer? mixer = _mixer;
-        if (session == null || stream == null || mixer == null)
+        if (session == null || mixer == null)
         {
             return;
         }
+
+        Stream stream;
+        try
+        {
+            using CancellationTokenSource timeout = new(TimeSpan.FromSeconds(5));
+            stream = await session.WaitForAudioAsync(timeout.Token).ConfigureAwait(false);
+        }
+        catch
+        {
+            SetWarning("声音管道未能接通，本次将保存为无声视频。");
+            return;
+        }
+
+        _streamsGo.Wait();
 
         byte[] chunk = new byte[mixer.ChunkBytes];
         long produced = 0;
@@ -482,7 +505,7 @@ public sealed class Recorder : IDisposable
                 }
 
                 mixer.Read(chunk, 0, chunk.Length);
-                await stream.WriteAsync(chunk.AsMemory(0, chunk.Length)).ConfigureAwait(false);
+                await WritePipeAsync(stream, chunk, produced == 0).ConfigureAwait(false);
                 produced++;
 
                 long nextDue = produced * LiveAudioMixer.ChunkMilliseconds;
@@ -495,6 +518,25 @@ public sealed class Recorder : IDisposable
         }
         catch
         {
+        }
+    }
+
+    private static async Task WritePipeAsync(Stream stream, byte[] buffer, bool firstWrite)
+    {
+        ValueTask write = stream.WriteAsync(buffer.AsMemory(0, buffer.Length));
+        if (!firstWrite)
+        {
+            await write.ConfigureAwait(false);
+            return;
+        }
+
+        try
+        {
+            await write.AsTask().WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            throw new TimeoutException("FFmpeg 首次写入超时。");
         }
     }
 
