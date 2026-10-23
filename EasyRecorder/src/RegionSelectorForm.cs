@@ -4,13 +4,12 @@ namespace EasyRecorder;
 
 public sealed class RegionSelectorForm : Form
 {
-    private Bitmap? _screenshot;
-    private Rectangle _virtualScreen;
+    private readonly Rectangle _virtualScreen;
+    private readonly Font _font = UiFonts.Create(10.5f);
+    private readonly Font _hintFont = UiFonts.Create(10f);
     private Point _start;
     private Rectangle _selection;
     private bool _dragging;
-    private readonly Font _font = UiFonts.Create(10.5f);
-    private readonly Font _hintFont = UiFonts.Create(10f);
 
     public Rectangle SelectedRegion { get; private set; }
     public bool Confirmed { get; private set; }
@@ -27,23 +26,8 @@ public sealed class RegionSelectorForm : Form
         DoubleBuffered = true;
         KeyPreview = true;
         BackColor = Color.Black;
+        Opacity = 0.45;
         Text = "选择录制区域";
-
-        try
-        {
-            _screenshot = new Bitmap(_virtualScreen.Width, _virtualScreen.Height);
-            using Graphics graphics = Graphics.FromImage(_screenshot);
-            graphics.CopyFromScreen(
-                _virtualScreen.Location,
-                Point.Empty,
-                _virtualScreen.Size,
-                CopyPixelOperation.SourceCopy);
-        }
-        catch
-        {
-            _screenshot?.Dispose();
-            _screenshot = null;
-        }
     }
 
     protected override void OnShown(EventArgs e)
@@ -62,7 +46,7 @@ public sealed class RegionSelectorForm : Form
             return;
         }
 
-        if (e.KeyCode == Keys.Enter && _selection.Width >= 32 && _selection.Height >= 32)
+        if (e.KeyCode == Keys.Enter && _selection.Width >= 16 && _selection.Height >= 16)
         {
             ConfirmSelection();
             return;
@@ -79,10 +63,12 @@ public sealed class RegionSelectorForm : Form
         }
 
         _dragging = true;
+        Capture = true;
         _start = new Point(
             Math.Clamp(e.X, 0, ClientSize.Width - 1),
             Math.Clamp(e.Y, 0, ClientSize.Height - 1));
         _selection = new Rectangle(_start, Size.Empty);
+        ApplyOverlayRegion();
         Invalidate();
         base.OnMouseDown(e);
     }
@@ -101,6 +87,7 @@ public sealed class RegionSelectorForm : Form
             Math.Min(_start.Y, y),
             Math.Max(_start.X, x),
             Math.Max(_start.Y, y));
+        ApplyOverlayRegion();
         Invalidate();
         base.OnMouseMove(e);
     }
@@ -113,13 +100,15 @@ public sealed class RegionSelectorForm : Form
         }
 
         _dragging = false;
-        if (_selection.Width >= 32 && _selection.Height >= 32)
+        Capture = false;
+        if (_selection.Width >= 16 && _selection.Height >= 16)
         {
             ConfirmSelection();
             return;
         }
 
         _selection = Rectangle.Empty;
+        ApplyOverlayRegion();
         Invalidate();
         base.OnMouseUp(e);
     }
@@ -142,36 +131,61 @@ public sealed class RegionSelectorForm : Form
         Close();
     }
 
+    private void ApplyOverlayRegion()
+    {
+        Region overlay = new(new Rectangle(0, 0, ClientSize.Width, ClientSize.Height));
+        if (_selection.Width > 4 && _selection.Height > 4)
+        {
+            Rectangle hole = _selection;
+            hole.Inflate(-2, -2);
+            if (hole.Width > 0 && hole.Height > 0)
+            {
+                overlay.Exclude(hole);
+            }
+
+            overlay.Union(GetSizeLabelRect());
+            overlay.Union(GetHintRect());
+        }
+
+        Region? previous = Region;
+        Region = overlay;
+        previous?.Dispose();
+    }
+
+    private Rectangle GetSizeLabelRect()
+    {
+        string sizeText = $"{_selection.Width} × {_selection.Height}";
+        Size textSize = TextRenderer.MeasureText(sizeText, _font);
+        int labelX = Math.Max(4, _selection.Left);
+        int labelY = _selection.Top - textSize.Height - 12;
+        if (labelY < 4)
+        {
+            labelY = _selection.Top + 8;
+        }
+
+        return new Rectangle(labelX, labelY, textSize.Width + 20, textSize.Height + 10);
+    }
+
+    private Rectangle GetHintRect()
+    {
+        const string hint = "拖动鼠标框选要录制的区域，松开即可 · 按 Esc 取消";
+        Size hintSize = TextRenderer.MeasureText(hint, _hintFont);
+        int hintWidth = hintSize.Width + 40;
+        return new Rectangle(
+            Math.Max(10, (ClientSize.Width - hintWidth) / 2),
+            16,
+            hintWidth,
+            hintSize.Height + 16);
+    }
+
     protected override void OnPaint(PaintEventArgs e)
     {
         Graphics g = e.Graphics;
         g.SmoothingMode = SmoothingMode.AntiAlias;
-
-        if (_screenshot != null)
-        {
-            g.DrawImageUnscaled(_screenshot, 0, 0);
-        }
-        else
-        {
-            g.Clear(Color.FromArgb(32, 32, 32));
-        }
-
-        using (SolidBrush dim = new(Color.FromArgb(145, 0, 0, 0)))
-        {
-            g.FillRectangle(dim, ClientRectangle);
-        }
+        g.Clear(Color.Black);
 
         if (_selection.Width > 0 && _selection.Height > 0)
         {
-            if (_screenshot != null)
-            {
-                g.DrawImage(
-                    _screenshot,
-                    _selection,
-                    _selection,
-                    GraphicsUnit.Pixel);
-            }
-
             using Pen border = new(Color.FromArgb(255, 77, 79), 2);
             g.DrawRectangle(
                 border,
@@ -180,16 +194,7 @@ public sealed class RegionSelectorForm : Form
                 _selection.Width - 1,
                 _selection.Height - 1);
 
-            string sizeText = $"{_selection.Width} × {_selection.Height}";
-            Size textSize = TextRenderer.MeasureText(sizeText, _font);
-            int labelX = Math.Max(4, _selection.Left);
-            int labelY = _selection.Top - textSize.Height - 12;
-            if (labelY < 4)
-            {
-                labelY = _selection.Top + 8;
-            }
-
-            Rectangle labelRect = new(labelX, labelY, textSize.Width + 20, textSize.Height + 10);
+            Rectangle labelRect = GetSizeLabelRect();
             using (GraphicsPath path = ToolButton.RoundedRect(labelRect, 6))
             using (SolidBrush brush = new(Color.FromArgb(220, 20, 20, 20)))
             {
@@ -198,21 +203,14 @@ public sealed class RegionSelectorForm : Form
 
             TextRenderer.DrawText(
                 g,
-                sizeText,
+                $"{_selection.Width} × {_selection.Height}",
                 _font,
                 labelRect,
                 Color.White,
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
         }
 
-        string hint = "拖动鼠标框选要录制的区域，松开即可 · 按 Esc 取消";
-        Size hintSize = TextRenderer.MeasureText(hint, _hintFont);
-        int hintWidth = hintSize.Width + 40;
-        Rectangle hintRect = new(
-            Math.Max(10, (ClientSize.Width - hintWidth) / 2),
-            16,
-            hintWidth,
-            hintSize.Height + 16);
+        Rectangle hintRect = GetHintRect();
         using (GraphicsPath path = ToolButton.RoundedRect(hintRect, 10))
         using (SolidBrush brush = new(Color.FromArgb(225, 18, 18, 18)))
         {
@@ -227,7 +225,7 @@ public sealed class RegionSelectorForm : Form
 
         TextRenderer.DrawText(
             g,
-            hint,
+            "拖动鼠标框选要录制的区域，松开即可 · 按 Esc 取消",
             _hintFont,
             hintRect,
             Color.FromArgb(235, 235, 235),
@@ -238,7 +236,6 @@ public sealed class RegionSelectorForm : Form
     {
         if (disposing)
         {
-            _screenshot?.Dispose();
             _font.Dispose();
             _hintFont.Dispose();
         }

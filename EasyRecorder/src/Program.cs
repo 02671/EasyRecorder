@@ -4,15 +4,54 @@ namespace EasyRecorder;
 
 internal static class Program
 {
+    private const string MutexName = @"Local\EasyRecorder.SingleInstance";
+    private const string ShowEventName = @"Local\EasyRecorder.ShowExisting";
+
+    private static Mutex? _mutex;
+    private static EventWaitHandle? _showEvent;
+
     [STAThread]
     private static void Main()
     {
+        _mutex = new Mutex(true, MutexName, out bool createdNew);
+        _showEvent = new EventWaitHandle(false, EventResetMode.AutoReset, ShowEventName);
+        if (!createdNew)
+        {
+            _showEvent.Set();
+            return;
+        }
+
         ApplicationConfiguration.Initialize();
         Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
         Application.ThreadException += (_, e) => ReportFatal(e.Exception);
         AppDomain.CurrentDomain.UnhandledException += (_, e) => ReportFatal(e.ExceptionObject as Exception);
 
-        Application.Run(new MainForm());
+        MainForm form = new();
+        Thread watcher = new(() => WatchShowRequests(form))
+        {
+            IsBackground = true,
+            Name = "EasyRecorder.ShowExisting"
+        };
+        watcher.Start();
+        Application.Run(form);
+    }
+
+    private static void WatchShowRequests(MainForm form)
+    {
+        while (true)
+        {
+            _showEvent!.WaitOne();
+            try
+            {
+                if (!form.IsDisposed && form.IsHandleCreated)
+                {
+                    form.BeginInvoke(form.RestoreFromSecondInstance);
+                }
+            }
+            catch
+            {
+            }
+        }
     }
 
     private static void ReportFatal(Exception? ex)

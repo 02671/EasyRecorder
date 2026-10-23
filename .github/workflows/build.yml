@@ -21,7 +21,7 @@ jobs:
 
       - name: Publish
         run: |
-          dotnet publish EasyRecorder/EasyRecorder.csproj -c Release -r win-x64 -p:Platform=x64 --self-contained true -p:PublishSingleFile=true -p:EnableCompressionInSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:IncludeAllContentForSelfExtract=true -o publish
+          dotnet publish EasyRecorder/EasyRecorder.csproj -c Release -r win-x64 -p:Platform=x64 --self-contained true -p:PublishSingleFile=true -p:EnableCompressionInSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o publish
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
