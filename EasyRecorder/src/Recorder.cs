@@ -295,10 +295,10 @@ public sealed class Recorder : IDisposable
 
         if (sources.Count == 0)
         {
-            RecordableDisplay? main = DisplayRecordingSource.MainMonitor;
+            DisplayRecordingSource main = DisplayRecordingSource.MainMonitor;
             if (main != null)
             {
-                sources.Add(new DisplayRecordingSource(main));
+                sources.Add(main);
             }
         }
 
