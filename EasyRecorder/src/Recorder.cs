@@ -239,13 +239,12 @@ public sealed class Recorder : IDisposable
         {
             SourceOptions = new SourceOptions
             {
-                RecordingSources = CreateSources()
+                RecordingSources = CreateSources(region)
             },
             OutputOptions = new OutputOptions
             {
                 RecorderMode = RecorderMode.Video,
                 OutputFrameSize = new ScreenSize(region.Width, region.Height),
-                SourceRect = new ScreenRect(region.X, region.Y, region.Width, region.Height),
                 Stretch = StretchMode.Fill
             },
             AudioOptions = new AudioOptions
@@ -279,30 +278,90 @@ public sealed class Recorder : IDisposable
         };
     }
 
-    private static List<RecordingSourceBase> CreateSources()
+    private static List<RecordingSourceBase> CreateSources(Rectangle region)
     {
-        List<RecordingSourceBase> sources = new();
+        Screen screen = ScreenFromRegion(region);
+        DisplayRecordingSource source = CreateDisplaySource(screen);
+        Rectangle bounds = screen.Bounds;
+        Rectangle crop = Rectangle.Intersect(region, bounds);
+        crop.Width -= crop.Width % 2;
+        crop.Height -= crop.Height % 2;
+        if (crop.Width < 16 || crop.Height < 16)
+        {
+            crop = new Rectangle(bounds.Left, bounds.Top, bounds.Width - bounds.Width % 2, bounds.Height - bounds.Height % 2);
+        }
+
+        int x = crop.Left - bounds.Left;
+        int y = crop.Top - bounds.Top;
+        bool fullMonitor = x <= 0 && y <= 0 && crop.Width >= bounds.Width - 1 && crop.Height >= bounds.Height - 1;
+        if (!fullMonitor)
+        {
+            source.SourceRect = new ScreenRect(x, y, crop.Width, crop.Height);
+            source.OutputSize = new ScreenSize(crop.Width, crop.Height);
+        }
+
+        return new List<RecordingSourceBase> { source };
+    }
+
+    private static Screen ScreenFromRegion(Rectangle region)
+    {
+        Screen best = Screen.FromRectangle(region);
+        int bestArea = IntersectionArea(region, best.Bounds);
+        foreach (Screen screen in Screen.AllScreens)
+        {
+            int area = IntersectionArea(region, screen.Bounds);
+            if (area > bestArea)
+            {
+                best = screen;
+                bestArea = area;
+            }
+        }
+
+        return best;
+    }
+
+    private static int IntersectionArea(Rectangle a, Rectangle b)
+    {
+        Rectangle hit = Rectangle.Intersect(a, b);
+        if (hit.IsEmpty)
+        {
+            return 0;
+        }
+
+        return hit.Width * hit.Height;
+    }
+
+    private static DisplayRecordingSource CreateDisplaySource(Screen screen)
+    {
         try
         {
             foreach (var display in ScreenRecorderLib.Recorder.GetDisplays())
             {
-                sources.Add(new DisplayRecordingSource(display));
+                if (string.Equals(display.DeviceName, screen.DeviceName, StringComparison.OrdinalIgnoreCase))
+                {
+                    return new DisplayRecordingSource(display);
+                }
             }
         }
         catch
         {
         }
 
-        if (sources.Count == 0)
+        try
         {
-            DisplayRecordingSource main = DisplayRecordingSource.MainMonitor;
-            if (main != null)
-            {
-                sources.Add(main);
-            }
+            return new DisplayRecordingSource(screen.DeviceName);
+        }
+        catch
+        {
         }
 
-        return sources;
+        DisplayRecordingSource main = DisplayRecordingSource.MainMonitor;
+        if (main != null)
+        {
+            return main;
+        }
+
+        throw new InvalidOperationException("找不到可录制的显示器。");
     }
 
     private static List<AudioSourceBase> CreateAudioSources(AudioMode audioMode)
