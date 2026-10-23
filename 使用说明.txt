@@ -10,16 +10,6 @@ EasyRecorder 录屏工具 · 新手使用说明
     EasyRecorder.exe
     使用说明.txt（本文件）
 
-然后把你的 ffmpeg.exe 也放到同一个文件夹里，最终是这样：
-    D:\EasyRecorder\EasyRecorder.exe
-    D:\EasyRecorder\ffmpeg.exe
-    D:\EasyRecorder\使用说明.txt
-
-说明：
-- 程序会自动在“自己所在的文件夹”里找 ffmpeg.exe。
-- 如果你的 ffmpeg 在系统 PATH 里，也能自动找到。
-- 如果两处都没有，第一次点“录制”时，程序会弹窗让你手动选择 ffmpeg.exe，选一次后会自动记住。
-
 
 【第 2 步】双击运行
 ----------------------------------------
@@ -62,8 +52,9 @@ EasyRecorder 录屏工具 · 新手使用说明
 
 【常见问题】
 ----------------------------------------
-1. 提示“没有找到可用的 ffmpeg.exe”
-   把 ffmpeg.exe 放到 EasyRecorder.exe 旁边，或在弹窗里手动选择它。
+1. 提示缺少 Visual C++ 运行库
+   请安装 Microsoft Visual C++ Redistributable（x64）：
+   https://aka.ms/vs/17/release/vc_redist.x64.exe
 
 2. 录出来没有声音
    打开“选项”，确认声音来源没选成“不录声音”。
@@ -77,9 +68,12 @@ EasyRecorder 录屏工具 · 新手使用说明
 4. 想直接退出
    点“关闭”。如果正在录制，程序会先问你是否结束并保存。
 
+5. Windows N / KN 版无法录制
+   请先安装对应系统的媒体功能包（Media Feature Pack）。
+
 
 【系统要求】
 ----------------------------------------
 - Windows 10 / Windows 11（64 位）
-- 无需安装 .NET，无需安装其他运行库
-- 需要 ffmpeg.exe（你自己提供，放在程序旁边即可）
+- 无需安装 .NET，无需安装 FFmpeg
+- 需要 Microsoft Visual C++ Redistributable（x64）

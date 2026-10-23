@@ -207,6 +207,7 @@ public sealed class MainForm : Form
     {
         base.OnHandleCreated(e);
         NativeMethods.SetWindowDisplayAffinity(Handle, NativeMethods.WDA_EXCLUDEFROMCAPTURE);
+        TryExcludeFromCapture(Handle);
     }
 
     protected override void OnShown(EventArgs e)
@@ -219,24 +220,21 @@ public sealed class MainForm : Form
             PositionAtTop();
             Opacity = 1;
             NativeMethods.SetWindowDisplayAffinity(Handle, NativeMethods.WDA_EXCLUDEFROMCAPTURE);
-            PrepareEncoder();
+            TryExcludeFromCapture(Handle);
             ShowWelcomeOnce();
             _uiTimer.Start();
         }
     }
 
-    private void PrepareEncoder()
+    private static void TryExcludeFromCapture(IntPtr handle)
     {
-        string? ffmpeg = FfmpegLocator.Find(_settings);
-        if (string.IsNullOrWhiteSpace(ffmpeg))
+        try
         {
-            return;
+            ScreenRecorderLib.Recorder.SetExcludeFromCapture(handle, true);
         }
-
-        Rectangle region = _customRegion && _region.Width >= 16
-            ? _region
-            : Recorder.PrimaryScreenRegion();
-        _ = _recorder.PrepareAsync(ffmpeg, region, _settings.AudioMode);
+        catch
+        {
+        }
     }
 
     private void PositionAtTop()
@@ -257,17 +255,12 @@ public sealed class MainForm : Form
         _settings.WelcomeShown = true;
         _settings.Save();
 
-        string ffmpegNote = FfmpegLocator.Find(_settings) != null
-            ? "已找到 FFmpeg。"
-            : "还没有检测到 ffmpeg.exe，第一次点「录制」时会提示你选择。";
-
         MessageBox.Show(
             this,
             "欢迎使用 EasyRecorder。\n\n" +
-            "1. 把 ffmpeg.exe 放到本程序同一个文件夹（只需做一次）。\n" +
-            "2. 点「区域」框选画面；直接点「录制」则录制整个主屏幕。\n" +
-            "3. 点「结束」保存文件；点「取消」不保存。\n\n" +
-            ffmpegNote + "\n\n" +
+            "1. 点「区域」框选画面；直接点「录制」则录制整个主屏幕。\n" +
+            "2. 点「结束」保存文件；点「取消」不保存。\n" +
+            "3. 点「选项」可以改声音来源和保存位置。\n\n" +
             "录像默认保存到「视频」文件夹里的 EasyRecorder 文件夹。",
             "欢迎使用",
             MessageBoxButtons.OK,
@@ -321,7 +314,6 @@ public sealed class MainForm : Form
             PlaceNearRegion(_region);
             _regionBorder.ShowAround(_region);
             SetIdleUi();
-            PrepareEncoder();
         }
         else
         {
@@ -359,12 +351,6 @@ public sealed class MainForm : Form
             return;
         }
 
-        string? ffmpeg = FfmpegLocator.Ensure(this, _settings);
-        if (ffmpeg == null)
-        {
-            return;
-        }
-
         if (_region.Width < 16 || _region.Height < 16)
         {
             Rectangle bounds = Screen.PrimaryScreen?.Bounds ?? new Rectangle(0, 0, 1280, 720);
@@ -374,7 +360,7 @@ public sealed class MainForm : Form
         _recordButton.Enabled = false;
         try
         {
-            await _recorder.StartAsync(_region, ffmpeg, _settings.OutputFolder, _settings.AudioMode);
+            await _recorder.StartAsync(_region, _settings.OutputFolder, _settings.AudioMode);
             SetRecordingUi();
         }
         catch (Exception ex)
@@ -526,7 +512,6 @@ public sealed class MainForm : Form
         {
             options.ApplyTo(_settings);
             _settings.Save();
-            PrepareEncoder();
         }
     }
 

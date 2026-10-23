@@ -6,19 +6,14 @@ public sealed class OptionsForm : Form
 {
     private readonly RadioButton[] _audioOptions;
     private readonly TextBox _folderBox;
-    private readonly Label _ffmpegLabel;
-    private string? _ffmpegPath;
 
     public string ResultFolder { get; private set; }
     public AudioMode ResultAudioMode { get; private set; }
-    public string? ResultFfmpegPath { get; private set; }
 
     public OptionsForm(AppSettings settings)
     {
         ResultFolder = settings.OutputFolder;
         ResultAudioMode = settings.AudioMode;
-        ResultFfmpegPath = settings.FfmpegPath;
-        _ffmpegPath = settings.FfmpegPath;
 
         AutoScaleMode = AutoScaleMode.Dpi;
         AutoScaleDimensions = new SizeF(96F, 96F);
@@ -30,7 +25,7 @@ public sealed class OptionsForm : Form
         StartPosition = FormStartPosition.CenterParent;
         BackColor = Color.FromArgb(24, 24, 24);
         ForeColor = Color.White;
-        ClientSize = new Size(640, 500);
+        ClientSize = new Size(640, 360);
         Font = UiFonts.Create(9.5f);
         KeyPreview = true;
 
@@ -87,47 +82,9 @@ public sealed class OptionsForm : Form
 
         Controls.Add(MakeNote("录像会保存为 MP4 文件（视频 H.264，声音 AAC）。", 24, 280));
 
-        Panel line = new()
-        {
-            Location = new Point(24, 312),
-            Size = new Size(592, 1),
-            BackColor = Color.FromArgb(58, 58, 58)
-        };
-        Controls.Add(line);
-
-        Controls.Add(MakeSectionLabel("FFmpeg", 24, 326));
-
-        _ffmpegLabel = new Label
-        {
-            Text = string.IsNullOrWhiteSpace(_ffmpegPath)
-                ? "未找到（录制时会提示你选择）"
-                : _ffmpegPath,
-            Location = new Point(24, 356),
-            Size = new Size(460, 30),
-            ForeColor = Color.FromArgb(180, 180, 180),
-            AutoEllipsis = true,
-            TextAlign = ContentAlignment.MiddleLeft
-        };
-        Controls.Add(_ffmpegLabel);
-
-        ToolButton browseFfmpeg = new("选择...")
-        {
-            Location = new Point(494, 354),
-            Size = new Size(120, 32)
-        };
-        browseFfmpeg.Click += BrowseFfmpeg_Click;
-        Controls.Add(browseFfmpeg);
-
-        Controls.Add(MakeNote(
-            "把 ffmpeg.exe 放到 EasyRecorder.exe 同一个文件夹即可自动识别；\n也可以点「选择」手动指定。",
-            24,
-            392,
-            560,
-            44));
-
         ToolButton cancel = new("取消")
         {
-            Location = new Point(430, 448),
+            Location = new Point(430, 308),
             Size = new Size(90, 34)
         };
         cancel.Click += (_, _) =>
@@ -139,7 +96,7 @@ public sealed class OptionsForm : Form
 
         ToolButton save = new("保存")
         {
-            Location = new Point(530, 448),
+            Location = new Point(530, 308),
             Size = new Size(90, 34),
             Accent = true
         };
@@ -246,36 +203,6 @@ public sealed class OptionsForm : Form
         }
     }
 
-    private void BrowseFfmpeg_Click(object? sender, EventArgs e)
-    {
-        using OpenFileDialog dialog = new()
-        {
-            Title = "请选择 ffmpeg.exe",
-            Filter = "FFmpeg 程序 (ffmpeg.exe)|ffmpeg.exe|可执行文件 (*.exe)|*.exe",
-            CheckFileExists = true,
-            Multiselect = false
-        };
-
-        if (dialog.ShowDialog(this) != DialogResult.OK)
-        {
-            return;
-        }
-
-        if (!FfmpegLocator.Validate(dialog.FileName))
-        {
-            MessageBox.Show(
-                this,
-                "这个文件不能正常运行，可能不是 Windows 版的 ffmpeg.exe。\n请换一个文件再试。",
-                "FFmpeg 不可用",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Warning);
-            return;
-        }
-
-        _ffmpegPath = dialog.FileName;
-        _ffmpegLabel.Text = _ffmpegPath;
-    }
-
     private void Save_Click(object? sender, EventArgs e)
     {
         string folder = _folderBox.Text.Trim();
@@ -300,7 +227,6 @@ public sealed class OptionsForm : Form
         }
 
         ResultFolder = folder;
-        ResultFfmpegPath = _ffmpegPath;
 
         if (_audioOptions[0].Checked)
         {
@@ -339,6 +265,5 @@ public sealed class OptionsForm : Form
     {
         settings.OutputFolder = ResultFolder;
         settings.AudioMode = ResultAudioMode;
-        settings.FfmpegPath = ResultFfmpegPath;
     }
 }

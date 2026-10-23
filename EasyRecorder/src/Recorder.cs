@@ -1,46 +1,22 @@
 using System.Diagnostics;
-using System.Drawing;
-using System.Drawing.Imaging;
-using System.Runtime.InteropServices;
-using System.Windows.Forms;
-using NAudio.CoreAudioApi;
-using NAudio.Wave;
+using ScreenRecorderLib;
 
 namespace EasyRecorder;
 
 public sealed class Recorder : IDisposable
 {
-    private const int FramesPerSecond = 30;
-
-    private readonly object _sessionGate = new();
-    private readonly object _audioGate = new();
-    private readonly object _stopGate = new();
+    private readonly object _gate = new();
     private readonly Stopwatch _clock = new();
-    private readonly ManualResetEventSlim _streamsGo = new(false);
 
-    private FfmpegSession? _standby;
-    private FfmpegSession? _active;
-    private Task? _prepareTask;
-    private CancellationTokenSource? _prepareCts;
-    private Task? _videoTask;
-    private Task? _audioWriteTask;
-    private Task? _audioInitTask;
-    private LiveAudioMixer? _mixer;
-    private DxgiScreenCapture? _dxgi;
-    private WasapiLoopbackCapture? _systemCapture;
-    private WasapiCapture? _microphoneCapture;
-    private volatile bool _stopRequested;
-    private volatile bool _paused;
-    private volatile bool _acceptAudio;
-    private volatile bool _audioAbandoned;
-    private Rectangle _region;
+    private ScreenRecorderLib.Recorder? _engine;
+    private TaskCompletionSource<bool>? _started;
+    private TaskCompletionSource<string?>? _stopped;
     private string _outputFolder = string.Empty;
-    private string? _captureError;
-    private AudioMode _audioMode;
+    private string _outputPath = string.Empty;
     private DateTime _startedAt;
+    private bool _paused;
     private bool _disposed;
-    private bool _includeAudio;
-    private string _ffmpegPath = string.Empty;
+    private string? _failure;
 
     public bool IsRecording { get; private set; }
     public bool IsPaused => _paused;
@@ -49,55 +25,13 @@ public sealed class Recorder : IDisposable
 
     public event Action<string>? WarningRaised;
 
-    public Task PrepareAsync(string ffmpegPath, Rectangle region, AudioMode audioMode)
+    public Task StartAsync(Rectangle region, string outputFolder, AudioMode audioMode)
     {
-        if (_disposed || string.IsNullOrWhiteSpace(ffmpegPath))
+        if (IsRecording)
         {
             return Task.CompletedTask;
         }
 
-        Rectangle prepared = NormalizeRegion(region);
-        Size size = prepared.Size;
-        bool includeAudio = audioMode != AudioMode.None;
-
-        _ffmpegPath = ffmpegPath;
-        _audioMode = audioMode;
-        _region = prepared;
-
-        lock (_sessionGate)
-        {
-            if (IsRecording)
-            {
-                return Task.CompletedTask;
-            }
-
-            if (_standby is { IsAlive: true, IsReady: true } && _standby.Matches(size, includeAudio))
-            {
-                return Task.CompletedTask;
-            }
-
-            _prepareCts?.Cancel();
-            _prepareCts?.Dispose();
-            _prepareCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-            CancellationToken token = _prepareCts.Token;
-            string path = ffmpegPath;
-            _prepareTask = Task.Run(() => ReplaceStandbyAsync(path, size, includeAudio, token), token);
-            return _prepareTask;
-        }
-    }
-
-    public async Task StartAsync(Rectangle region, string ffmpegPath, string outputFolder, AudioMode audioMode)
-    {
-        if (IsRecording)
-        {
-            return;
-        }
-
-        await StartCoreAsync(region, ffmpegPath, outputFolder, audioMode).ConfigureAwait(false);
-    }
-
-    private async Task StartCoreAsync(Rectangle region, string ffmpegPath, string outputFolder, AudioMode audioMode)
-    {
         region = NormalizeRegion(region);
         if (region.Width < 16 || region.Height < 16)
         {
@@ -105,213 +39,76 @@ public sealed class Recorder : IDisposable
         }
 
         Directory.CreateDirectory(outputFolder);
-        _region = region;
-        _audioMode = audioMode;
         _outputFolder = outputFolder;
-        _ffmpegPath = ffmpegPath;
         _startedAt = DateTime.Now;
-        _captureError = null;
+        _outputPath = GetPlannedOutputPath();
         Warning = null;
-        _stopRequested = false;
+        _failure = null;
         _paused = false;
-        _acceptAudio = false;
-        _includeAudio = audioMode != AudioMode.None;
         _clock.Reset();
-        _streamsGo.Reset();
 
-        FfmpegSession session;
+        TaskCompletionSource<bool> started = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        _started = started;
+        _stopped = null;
+
         try
         {
-            using CancellationTokenSource startTimeout = new(TimeSpan.FromSeconds(5));
-            session = await TakeOrCreateSessionAsync(ffmpegPath, region.Size, _includeAudio, startTimeout.Token).ConfigureAwait(false);
-            _active = session;
-            _dxgi = DxgiScreenCapture.TryCreate(_region);
-            if (_includeAudio)
-            {
-                _mixer = new LiveAudioMixer();
-                StartAudioCapture();
-            }
+            ScreenRecorderLib.Recorder engine = ScreenRecorderLib.Recorder.CreateRecorder(BuildOptions(region, audioMode));
+            engine.OnRecordingComplete += OnRecordingComplete;
+            engine.OnRecordingFailed += OnRecordingFailed;
+            engine.OnStatusChanged += OnStatusChanged;
+            _engine = engine;
+            engine.Record(_outputPath);
+        }
+        catch (DllNotFoundException)
+        {
+            ReleaseEngine();
+            throw new InvalidOperationException(
+                "录制组件无法加载。请安装 Microsoft Visual C++ Redistributable（x64）后重试。");
+        }
+        catch (Exception ex)
+        {
+            ReleaseEngine();
+            throw new InvalidOperationException(FriendlyStartError(ex), ex);
+        }
 
-            _videoTask = Task.Run(VideoLoopAsync);
-            if (_includeAudio)
-            {
-                _audioWriteTask = Task.Run(AudioWriteLoopAsync);
-            }
+        return WaitUntilStartedAsync(started);
+    }
 
-            _clock.Start();
-            _streamsGo.Set();
-            IsRecording = true;
+    private async Task WaitUntilStartedAsync(TaskCompletionSource<bool> started)
+    {
+        try
+        {
+            using CancellationTokenSource timeout = new(TimeSpan.FromSeconds(8));
+            await started.Task.WaitAsync(timeout.Token).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
-            _streamsGo.Set();
             await AbortStartAsync().ConfigureAwait(false);
-            throw new TimeoutException("FFmpeg 启动超时。");
+            throw new TimeoutException("录制启动超时。");
         }
         catch
         {
-            _streamsGo.Set();
             await AbortStartAsync().ConfigureAwait(false);
             throw;
         }
-    }
 
-    private async Task<FfmpegSession> TakeOrCreateSessionAsync(
-        string ffmpegPath,
-        Size size,
-        bool includeAudio,
-        CancellationToken cancellationToken)
-    {
-        Task? pending;
-        lock (_sessionGate)
+        lock (_gate)
         {
-            pending = _prepareTask;
-        }
-
-        if (pending != null)
-        {
-            try
+            if (!string.IsNullOrWhiteSpace(_failure))
             {
-                await pending.WaitAsync(cancellationToken).ConfigureAwait(false);
-            }
-            catch
-            {
-            }
-        }
-
-        lock (_sessionGate)
-        {
-            FfmpegSession? standby = _standby;
-            if (standby != null && standby.IsAlive && standby.IsReady && standby.Matches(size, includeAudio))
-            {
-                _standby = null;
-                return standby;
+                throw new InvalidOperationException(_failure);
             }
 
-            DiscardStandbyLocked();
-        }
-
-        return await FfmpegSession.StartAsync(ffmpegPath, size, includeAudio, cancellationToken).ConfigureAwait(false);
-    }
-
-    private async Task ReplaceStandbyAsync(string ffmpegPath, Size size, bool includeAudio, CancellationToken token)
-    {
-        FfmpegSession session = await FfmpegSession.StartAsync(ffmpegPath, size, includeAudio, token).ConfigureAwait(false);
-        lock (_sessionGate)
-        {
-            if (token.IsCancellationRequested || _disposed || IsRecording)
+            if (!IsRecording)
             {
-                session.Dispose();
-                TryDeleteDirectory(session.TempDirectory);
-                return;
-            }
-
-            DiscardStandbyLocked();
-            _standby = session;
-        }
-    }
-
-    private void DiscardStandbyLocked()
-    {
-        FfmpegSession? old = _standby;
-        _standby = null;
-        if (old == null)
-        {
-            return;
-        }
-
-        Task.Run(() =>
-        {
-            string temp = old.TempDirectory;
-            old.Dispose();
-            TryDeleteDirectory(temp);
-        });
-    }
-
-    private void StartAudioCapture()
-    {
-        _audioAbandoned = false;
-        _acceptAudio = true;
-        _audioInitTask = Task.Run(InitializeAudio);
-    }
-
-    private void InitializeAudio()
-    {
-        if (_audioMode is AudioMode.System or AudioMode.Both)
-        {
-            try
-            {
-                WasapiLoopbackCapture capture = new();
-                capture.DataAvailable += SystemCapture_DataAvailable;
-
-                lock (_audioGate)
+                IsRecording = true;
+                if (!_clock.IsRunning)
                 {
-                    if (_audioAbandoned || _stopRequested)
-                    {
-                        capture.Dispose();
-                        return;
-                    }
-
-                    _systemCapture = capture;
-                    _mixer?.AttachSystem(capture.WaveFormat);
+                    _clock.Start();
                 }
-
-                capture.StartRecording();
-            }
-            catch
-            {
-                SetWarning("系统声音无法采集，已跳过。");
-                DisposeSystemAudio();
             }
         }
-
-        if (_audioMode is AudioMode.Microphone or AudioMode.Both)
-        {
-            try
-            {
-                WasapiCapture capture = new();
-                capture.DataAvailable += MicrophoneCapture_DataAvailable;
-
-                lock (_audioGate)
-                {
-                    if (_audioAbandoned || _stopRequested)
-                    {
-                        capture.Dispose();
-                        return;
-                    }
-
-                    _microphoneCapture = capture;
-                    _mixer?.AttachMicrophone(capture.WaveFormat);
-                }
-
-                capture.StartRecording();
-            }
-            catch
-            {
-                SetWarning("麦克风无法采集，已跳过（请检查 Windows 隐私设置中的麦克风权限）。");
-                DisposeMicrophoneAudio();
-            }
-        }
-    }
-
-    private void SystemCapture_DataAvailable(object? sender, WaveInEventArgs e)
-    {
-        if (!_acceptAudio || _paused || _stopRequested || e.BytesRecorded <= 0)
-        {
-            return;
-        }
-
-        _mixer?.WriteSystem(e.Buffer, e.BytesRecorded);
-    }
-
-    private void MicrophoneCapture_DataAvailable(object? sender, WaveInEventArgs e)
-    {
-        if (!_acceptAudio || _paused || _stopRequested || e.BytesRecorded <= 0)
-        {
-            return;
-        }
-
-        _mixer?.WriteMicrophone(e.Buffer, e.BytesRecorded);
     }
 
     public void Pause()
@@ -319,6 +116,14 @@ public sealed class Recorder : IDisposable
         if (!IsRecording || _paused)
         {
             return;
+        }
+
+        try
+        {
+            _engine?.Pause();
+        }
+        catch
+        {
         }
 
         _paused = true;
@@ -332,353 +137,307 @@ public sealed class Recorder : IDisposable
             return;
         }
 
+        try
+        {
+            _engine?.Resume();
+        }
+        catch
+        {
+        }
+
         _paused = false;
         _clock.Start();
     }
 
-    private async Task VideoLoopAsync()
-    {
-        _streamsGo.Wait();
-        FfmpegSession? session = _active;
-        Stream? stream = session?.VideoStream;
-        if (session == null || stream == null)
-        {
-            _captureError = "视频管道未就绪。";
-            return;
-        }
-
-        try
-        {
-            int width = _region.Width;
-            int height = _region.Height;
-            int rowBytes = width * 4;
-            byte[] buffer = new byte[rowBytes * height];
-
-            using Bitmap bitmap = new(width, height, PixelFormat.Format32bppArgb);
-            using Graphics graphics = Graphics.FromImage(bitmap);
-
-            long produced = 0;
-            while (!_stopRequested)
-            {
-                if (_paused)
-                {
-                    await Task.Delay(10).ConfigureAwait(false);
-                    continue;
-                }
-
-                CaptureFrame(bitmap, graphics);
-                CopyBitmap(bitmap, buffer, width, height, rowBytes);
-
-                long target = (long)(_clock.Elapsed.TotalMilliseconds * FramesPerSecond / 1000.0);
-                if (target - produced > FramesPerSecond)
-                {
-                    produced = target;
-                }
-
-                while (produced < target && !_stopRequested)
-                {
-                    await WritePipeAsync(stream, buffer, produced == 0).ConfigureAwait(false);
-                    produced++;
-                }
-
-                long nextDue = (produced + 1) * 1000 / FramesPerSecond;
-                int wait = (int)(nextDue - _clock.Elapsed.TotalMilliseconds);
-                if (wait > 2)
-                {
-                    await Task.Delay(wait).ConfigureAwait(false);
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            if (!_stopRequested)
-            {
-                _captureError = "视频写入失败：" + ex.Message;
-            }
-        }
-    }
-
-    private static void CopyBitmap(Bitmap bitmap, byte[] buffer, int width, int height, int rowBytes)
-    {
-        BitmapData data = bitmap.LockBits(
-            new Rectangle(0, 0, width, height),
-            ImageLockMode.ReadOnly,
-            PixelFormat.Format32bppArgb);
-        try
-        {
-            if (data.Stride == rowBytes)
-            {
-                Marshal.Copy(data.Scan0, buffer, 0, buffer.Length);
-            }
-            else
-            {
-                IntPtr top = data.Stride > 0
-                    ? data.Scan0
-                    : data.Scan0 + data.Stride * (height - 1);
-                for (int y = 0; y < height; y++)
-                {
-                    IntPtr source = top + y * data.Stride;
-                    Marshal.Copy(source, buffer, y * rowBytes, rowBytes);
-                }
-            }
-        }
-        finally
-        {
-            bitmap.UnlockBits(data);
-        }
-    }
-
-    private void CaptureFrame(Bitmap bitmap, Graphics graphics)
-    {
-        bool captured = false;
-        DxgiScreenCapture? dxgi = _dxgi;
-        if (dxgi != null)
-        {
-            try
-            {
-                captured = dxgi.TryCapture(bitmap, _region);
-                if (!dxgi.IsAvailable)
-                {
-                    _dxgi = null;
-                    dxgi.Dispose();
-                }
-            }
-            catch
-            {
-                captured = false;
-            }
-        }
-
-        if (!captured)
-        {
-            try
-            {
-                graphics.CopyFromScreen(
-                    _region.Left,
-                    _region.Top,
-                    0,
-                    0,
-                    new Size(_region.Width, _region.Height),
-                    CopyPixelOperation.SourceCopy);
-            }
-            catch
-            {
-            }
-        }
-
-        DrawCursor(graphics, _region.Location);
-    }
-
-    private async Task AudioWriteLoopAsync()
-    {
-        FfmpegSession? session = _active;
-        LiveAudioMixer? mixer = _mixer;
-        if (session == null || mixer == null)
-        {
-            return;
-        }
-
-        Stream stream;
-        try
-        {
-            using CancellationTokenSource timeout = new(TimeSpan.FromSeconds(5));
-            stream = await session.WaitForAudioAsync(timeout.Token).ConfigureAwait(false);
-        }
-        catch
-        {
-            SetWarning("声音管道未能接通，本次将保存为无声视频。");
-            return;
-        }
-
-        _streamsGo.Wait();
-
-        byte[] chunk = new byte[mixer.ChunkBytes];
-        long produced = 0;
-        try
-        {
-            while (!_stopRequested)
-            {
-                if (_paused)
-                {
-                    await Task.Delay(10).ConfigureAwait(false);
-                    continue;
-                }
-
-                mixer.Read(chunk, 0, chunk.Length);
-                await WritePipeAsync(stream, chunk, produced == 0).ConfigureAwait(false);
-                produced++;
-
-                long nextDue = produced * LiveAudioMixer.ChunkMilliseconds;
-                int wait = (int)(nextDue - _clock.Elapsed.TotalMilliseconds);
-                if (wait > 2)
-                {
-                    await Task.Delay(wait).ConfigureAwait(false);
-                }
-            }
-        }
-        catch
-        {
-        }
-    }
-
-    private static async Task WritePipeAsync(Stream stream, byte[] buffer, bool firstWrite)
-    {
-        ValueTask write = stream.WriteAsync(buffer.AsMemory(0, buffer.Length));
-        if (!firstWrite)
-        {
-            await write.ConfigureAwait(false);
-            return;
-        }
-
-        try
-        {
-            await write.AsTask().WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
-        }
-        catch (TimeoutException)
-        {
-            throw new TimeoutException("FFmpeg 首次写入超时。");
-        }
-    }
-
-    private static void DrawCursor(Graphics graphics, Point origin)
-    {
-        NativeMethods.CURSORINFO cursor = new()
-        {
-            cbSize = Marshal.SizeOf<NativeMethods.CURSORINFO>()
-        };
-
-        if (!NativeMethods.GetCursorInfo(ref cursor) ||
-            cursor.flags != NativeMethods.CURSOR_SHOWING ||
-            cursor.hCursor == IntPtr.Zero)
-        {
-            return;
-        }
-
-        if (!NativeMethods.GetIconInfo(cursor.hCursor, out NativeMethods.ICONINFO icon))
-        {
-            return;
-        }
-
-        try
-        {
-            int x = cursor.ptScreenPos.X - origin.X - icon.xHotspot;
-            int y = cursor.ptScreenPos.Y - origin.Y - icon.yHotspot;
-            IntPtr hdc = graphics.GetHdc();
-            try
-            {
-                NativeMethods.DrawIconEx(
-                    hdc,
-                    x,
-                    y,
-                    cursor.hCursor,
-                    0,
-                    0,
-                    0,
-                    IntPtr.Zero,
-                    NativeMethods.DI_NORMAL);
-            }
-            finally
-            {
-                graphics.ReleaseHdc(hdc);
-            }
-        }
-        finally
-        {
-            if (icon.hbmMask != IntPtr.Zero)
-            {
-                NativeMethods.DeleteObject(icon.hbmMask);
-            }
-
-            if (icon.hbmColor != IntPtr.Zero)
-            {
-                NativeMethods.DeleteObject(icon.hbmColor);
-            }
-        }
-    }
-
     public async Task<string?> StopAsync(bool discard)
     {
-        lock (_stopGate)
+        ScreenRecorderLib.Recorder? engine;
+        TaskCompletionSource<string?> stopped;
+
+        lock (_gate)
         {
-            if (!IsRecording)
+            if (!IsRecording && _engine == null)
             {
                 return null;
             }
 
             IsRecording = false;
+            engine = _engine;
+            stopped = _stopped ?? new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
+            _stopped = stopped;
         }
 
         _clock.Stop();
-        _stopRequested = true;
-        _streamsGo.Set();
 
-        await WaitQuietly(_videoTask, 4000).ConfigureAwait(false);
-        await StopAudioCaptureAsync().ConfigureAwait(false);
-
-        FfmpegSession? session = _active;
-        _active = null;
-        if (session != null)
+        if (engine == null)
         {
-            await session.FinishAsync().ConfigureAwait(false);
+            return null;
         }
 
-        string? path = null;
         try
         {
-            if (!discard)
-            {
-                path = CollectOutput(session);
-            }
+            engine.Stop();
         }
-        finally
+        catch (Exception ex)
         {
-            CleanupCapture();
-            if (session != null)
+            ReleaseEngine();
+            if (discard)
             {
-                string temp = session.TempDirectory;
-                session.Dispose();
-                if (discard)
-                {
-                    TryDeleteDirectory(temp);
-                }
-                else
-                {
-                    TryDeleteDirectory(temp);
-                }
+                TryDeleteFile(_outputPath);
+                return null;
             }
+
+            throw new InvalidOperationException("结束录制失败：" + ex.Message, ex);
         }
 
-        SpawnStandby();
-        return path;
-    }
-
-    private string CollectOutput(FfmpegSession? session)
-    {
-        string? videoError = _captureError;
-        if (session == null || !File.Exists(session.OutputPath) || new FileInfo(session.OutputPath).Length == 0)
+        string? path;
+        try
         {
-            string log = session?.GetLog() ?? string.Empty;
-            throw new InvalidOperationException(
-                "录像没有成功生成。" +
-                (videoError != null ? "\n\n" + videoError : string.Empty) +
-                (string.IsNullOrWhiteSpace(log) ? string.Empty : "\n\nFFmpeg 信息：\n" + log));
+            path = await stopped.Task.WaitAsync(TimeSpan.FromSeconds(45)).ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            ReleaseEngine();
+            if (discard)
+            {
+                TryDeleteFile(_outputPath);
+                return null;
+            }
+
+            throw new TimeoutException("保存录像超时。");
         }
 
-        Directory.CreateDirectory(_outputFolder);
-        string finalPath = GetPlannedOutputPath();
-        File.Move(session.OutputPath, finalPath, true);
+        ReleaseEngine();
+
+        if (discard)
+        {
+            TryDeleteFile(path);
+            TryDeleteFile(_outputPath);
+            return null;
+        }
+
+        if (!string.IsNullOrWhiteSpace(_failure))
+        {
+            TryDeleteFile(path);
+            TryDeleteFile(_outputPath);
+            throw new InvalidOperationException(_failure);
+        }
+
+        string finalPath = string.IsNullOrWhiteSpace(path) ? _outputPath : path;
+        if (!File.Exists(finalPath) || new FileInfo(finalPath).Length == 0)
+        {
+            throw new InvalidOperationException("录像没有成功生成。");
+        }
+
         return finalPath;
     }
 
-    private void SpawnStandby()
+    private RecorderOptions BuildOptions(Rectangle region, AudioMode audioMode)
     {
-        if (_disposed || string.IsNullOrWhiteSpace(_ffmpegPath))
+        bool includeAudio = audioMode != AudioMode.None;
+        return new RecorderOptions
+        {
+            SourceOptions = new SourceOptions
+            {
+                RecordingSources = CreateSources()
+            },
+            OutputOptions = new OutputOptions
+            {
+                RecorderMode = RecorderMode.Video,
+                OutputFrameSize = new ScreenSize(region.Width, region.Height),
+                SourceRect = new ScreenRect(region.X, region.Y, region.Width, region.Height),
+                Stretch = StretchMode.Fill
+            },
+            AudioOptions = new AudioOptions
+            {
+                IsAudioEnabled = includeAudio,
+                Bitrate = AudioBitrate.bitrate_128kbps,
+                Channels = AudioChannels.Stereo,
+                AudioSources = CreateAudioSources(audioMode)
+            },
+            VideoEncoderOptions = new VideoEncoderOptions
+            {
+                Bitrate = ChooseBitrate(region.Width, region.Height),
+                Framerate = 30,
+                IsFixedFramerate = true,
+                Encoder = new H264VideoEncoder
+                {
+                    BitrateMode = H264BitrateControlMode.CBR,
+                    EncoderProfile = H264Profile.Main
+                },
+                IsHardwareEncodingEnabled = true,
+                IsLowLatencyEnabled = true,
+                IsMp4FastStartEnabled = true,
+                IsFragmentedMp4Enabled = false,
+                IsThrottlingDisabled = false
+            },
+            MouseOptions = new MouseOptions
+            {
+                IsMousePointerEnabled = true,
+                IsMouseClicksDetected = false
+            }
+        };
+    }
+
+    private static List<RecordingSourceBase> CreateSources()
+    {
+        List<RecordingSourceBase> sources = new();
+        try
+        {
+            foreach (var display in ScreenRecorderLib.Recorder.GetDisplays())
+            {
+                sources.Add(new DisplayRecordingSource(display));
+            }
+        }
+        catch
+        {
+        }
+
+        if (sources.Count == 0)
+        {
+            RecordableDisplay? main = DisplayRecordingSource.MainMonitor;
+            if (main != null)
+            {
+                sources.Add(new DisplayRecordingSource(main));
+            }
+        }
+
+        return sources;
+    }
+
+    private static List<AudioSourceBase> CreateAudioSources(AudioMode audioMode)
+    {
+        List<AudioSourceBase> sources = new();
+        switch (audioMode)
+        {
+            case AudioMode.System:
+                sources.Add(LoopbackAudioSource.Default);
+                break;
+            case AudioMode.Microphone:
+                sources.Add(CaptureAudioSource.Default);
+                break;
+            case AudioMode.Both:
+                sources.Add(LoopbackAudioSource.Default);
+                sources.Add(CaptureAudioSource.Default);
+                break;
+        }
+
+        return sources;
+    }
+
+    private void OnStatusChanged(object? sender, RecordingStatusEventArgs e)
+    {
+        switch (e.Status)
+        {
+            case RecorderStatus.Recording:
+                lock (_gate)
+                {
+                    IsRecording = true;
+                    _paused = false;
+                    if (!_clock.IsRunning)
+                    {
+                        _clock.Start();
+                    }
+                }
+
+                _started?.TrySetResult(true);
+                break;
+            case RecorderStatus.Paused:
+                _paused = true;
+                _clock.Stop();
+                break;
+        }
+    }
+
+    private void OnRecordingComplete(object? sender, RecordingCompleteEventArgs e)
+    {
+        string? path = string.IsNullOrWhiteSpace(e.FilePath) ? _outputPath : e.FilePath;
+        _started?.TrySetResult(true);
+        _stopped?.TrySetResult(path);
+    }
+
+    private void OnRecordingFailed(object? sender, RecordingFailedEventArgs e)
+    {
+        string message = string.IsNullOrWhiteSpace(e.Error) ? "录制失败。" : e.Error;
+        _failure = message;
+        lock (_gate)
+        {
+            IsRecording = false;
+        }
+
+        _clock.Stop();
+        _started?.TrySetException(new InvalidOperationException(message));
+        if (_stopped != null)
+        {
+            _stopped.TrySetResult(e.FilePath);
+        }
+        else
+        {
+            RaiseWarning(message);
+        }
+    }
+
+    private async Task AbortStartAsync()
+    {
+        ScreenRecorderLib.Recorder? engine = _engine;
+        if (engine != null)
+        {
+            try
+            {
+                engine.Stop();
+            }
+            catch
+            {
+            }
+        }
+
+        await Task.Delay(200).ConfigureAwait(false);
+        ReleaseEngine();
+        TryDeleteFile(_outputPath);
+        lock (_gate)
+        {
+            IsRecording = false;
+        }
+
+        _clock.Reset();
+    }
+
+    private void ReleaseEngine()
+    {
+        ScreenRecorderLib.Recorder? engine;
+        lock (_gate)
+        {
+            engine = _engine;
+            _engine = null;
+        }
+
+        if (engine == null)
         {
             return;
         }
 
-        Rectangle region = _region.Width >= 16 ? _region : PrimaryScreenRegion();
-        _ = PrepareAsync(_ffmpegPath, region, _audioMode);
+        engine.OnRecordingComplete -= OnRecordingComplete;
+        engine.OnRecordingFailed -= OnRecordingFailed;
+        engine.OnStatusChanged -= OnStatusChanged;
+        try
+        {
+            engine.Dispose();
+        }
+        catch
+        {
+        }
+    }
+
+    private void RaiseWarning(string message)
+    {
+        Warning = string.IsNullOrWhiteSpace(Warning) ? message : Warning + "\n" + message;
+        try
+        {
+            WarningRaised?.Invoke(message);
+        }
+        catch
+        {
+        }
     }
 
     private string GetPlannedOutputPath()
@@ -699,84 +458,32 @@ public sealed class Recorder : IDisposable
         return candidate;
     }
 
-    private async Task StopAudioCaptureAsync()
+    private static int ChooseBitrate(int width, int height)
     {
-        _acceptAudio = false;
-        _audioAbandoned = true;
-        await WaitQuietly(_audioInitTask, 3000).ConfigureAwait(false);
-        _audioInitTask = null;
+        int pixels = Math.Max(1, width) * Math.Max(1, height);
+        long bitrate = (long)pixels * 4;
+        if (bitrate < 2_000_000)
+        {
+            bitrate = 2_000_000;
+        }
+        else if (bitrate > 12_000_000)
+        {
+            bitrate = 12_000_000;
+        }
 
-        try { _systemCapture?.StopRecording(); } catch { }
-        try { _microphoneCapture?.StopRecording(); } catch { }
-
-        await WaitQuietly(_audioWriteTask, 3000).ConfigureAwait(false);
-        _audioWriteTask = null;
-
-        try { _systemCapture?.Dispose(); } catch { }
-        try { _microphoneCapture?.Dispose(); } catch { }
-        _systemCapture = null;
-        _microphoneCapture = null;
+        return (int)bitrate;
     }
 
-    private async Task AbortStartAsync()
+    private static string FriendlyStartError(Exception ex)
     {
-        _stopRequested = true;
-        _streamsGo.Set();
-        await WaitQuietly(_videoTask, 2000).ConfigureAwait(false);
-        await StopAudioCaptureAsync().ConfigureAwait(false);
-        FfmpegSession? session = _active;
-        _active = null;
-        CleanupCapture();
-        if (session != null)
+        string text = ex.Message ?? string.Empty;
+        if (text.Contains("Media Foundation", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("MF_", StringComparison.OrdinalIgnoreCase))
         {
-            string temp = session.TempDirectory;
-            session.Dispose();
-            TryDeleteDirectory(temp);
+            return "系统缺少 Media Foundation。Windows N / KN 版请先安装媒体功能包。";
         }
-    }
 
-    private void CleanupCapture()
-    {
-        try { _mixer?.Dispose(); } catch { }
-        _mixer = null;
-        try { _dxgi?.Dispose(); } catch { }
-        _dxgi = null;
-        _paused = false;
-        _clock.Reset();
-        _videoTask = null;
-        _audioWriteTask = null;
-    }
-
-    private void DisposeSystemAudio()
-    {
-        lock (_audioGate)
-        {
-            try { _systemCapture?.StopRecording(); } catch { }
-            _systemCapture?.Dispose();
-            _systemCapture = null;
-        }
-    }
-
-    private void DisposeMicrophoneAudio()
-    {
-        lock (_audioGate)
-        {
-            try { _microphoneCapture?.StopRecording(); } catch { }
-            _microphoneCapture?.Dispose();
-            _microphoneCapture = null;
-        }
-    }
-
-    private void SetWarning(string message)
-    {
-        Warning = string.IsNullOrWhiteSpace(Warning) ? message : Warning + "\n" + message;
-        try
-        {
-            WarningRaised?.Invoke(message);
-        }
-        catch
-        {
-        }
+        return string.IsNullOrWhiteSpace(text) ? "无法开始录制。" : text;
     }
 
     private static Rectangle NormalizeRegion(Rectangle region)
@@ -794,29 +501,18 @@ public sealed class Recorder : IDisposable
         return NormalizeRegion(new Rectangle(bounds.Left, bounds.Top, bounds.Width, bounds.Height));
     }
 
-    private static async Task WaitQuietly(Task? task, int milliseconds)
+    private static void TryDeleteFile(string? path)
     {
-        if (task == null)
+        if (string.IsNullOrWhiteSpace(path))
         {
             return;
         }
 
         try
         {
-            await task.WaitAsync(TimeSpan.FromMilliseconds(milliseconds)).ConfigureAwait(false);
-        }
-        catch
-        {
-        }
-    }
-
-    private static void TryDeleteDirectory(string path)
-    {
-        try
-        {
-            if (Directory.Exists(path))
+            if (File.Exists(path))
             {
-                Directory.Delete(path, true);
+                File.Delete(path);
             }
         }
         catch
@@ -832,22 +528,16 @@ public sealed class Recorder : IDisposable
         }
 
         _disposed = true;
-        _stopRequested = true;
-        _streamsGo.Set();
-        _prepareCts?.Cancel();
-        try { _prepareTask?.Wait(2000); } catch { }
-        lock (_sessionGate)
+        try
         {
-            DiscardStandbyLocked();
+            _engine?.Stop();
+        }
+        catch
+        {
         }
 
-        FfmpegSession? active = _active;
-        _active = null;
-        active?.Dispose();
-        CleanupCapture();
-        try { _systemCapture?.Dispose(); } catch { }
-        try { _microphoneCapture?.Dispose(); } catch { }
-        _streamsGo.Dispose();
-        _prepareCts?.Dispose();
+        ReleaseEngine();
+        _clock.Reset();
+        IsRecording = false;
     }
 }

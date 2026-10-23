@@ -15,7 +15,6 @@ public sealed class AppSettings
 {
     public string OutputFolder { get; set; } = DefaultOutputFolder();
     public AudioMode AudioMode { get; set; } = AudioMode.Both;
-    public string? FfmpegPath { get; set; }
     public bool WelcomeShown { get; set; }
 
     [JsonIgnore]

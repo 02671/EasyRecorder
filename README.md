@@ -8,23 +8,24 @@
 
 https://github.com/02671/EasyRecorder/releases/latest
 
-把 `ffmpeg.exe` 放到 `EasyRecorder.exe` 同一个文件夹后，双击运行。
+双击 `EasyRecorder.exe` 即可使用，无需安装 FFmpeg。
 
 ## 使用
 
-1. 把 `ffmpeg.exe` 放到程序同目录（只需一次）。
-2. 双击 `EasyRecorder.exe`。
-3. 点「区域」框选画面，或直接点「录制」录主屏幕。
-4. 点「结束」保存；点「取消」不保存。
+1. 双击 `EasyRecorder.exe`。
+2. 点「区域」框选画面，或直接点「录制」录主屏幕。
+3. 点「结束」保存；点「取消」不保存。
 
 录像默认保存在「视频」文件夹里的 EasyRecorder 目录。
+
+首次使用可能需要安装 [Microsoft Visual C++ Redistributable (x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe)。Windows N / KN 版还需安装媒体功能包。
 
 ## 自行编译
 
 需要 .NET 8 SDK：
 
 ```bash
-dotnet publish EasyRecorder/EasyRecorder.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:EnableCompressionInSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o publish
+dotnet publish EasyRecorder/EasyRecorder.csproj -c Release -r win-x64 -p:Platform=x64 --self-contained true -p:PublishSingleFile=true -p:EnableCompressionInSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o publish
 ```
 
 输出文件：`publish/EasyRecorder.exe`
