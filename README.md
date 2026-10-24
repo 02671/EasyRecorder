@@ -25,7 +25,7 @@ https://github.com/02671/EasyRecorder/releases/latest
 需要 .NET 8 SDK：
 
 ```bash
-dotnet publish EasyRecorder/EasyRecorder.csproj -c Release -r win-x64 -p:Platform=x64 --self-contained false -p:PublishSingleFile=true -p:EnableCompressionInSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o publish
+dotnet publish EasyRecorder/EasyRecorder.csproj -c Release -r win-x64 -p:Platform=x64 --self-contained false -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o publish
 ```
 
 输出文件：`publish/EasyRecorder.exe`
