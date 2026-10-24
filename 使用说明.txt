@@ -75,6 +75,9 @@ EasyRecorder 录屏工具 · 新手使用说明
    请安装 .NET 8 Desktop Runtime（x64）：
    https://dotnet.microsoft.com/en-us/download/dotnet/8.0
 
+7. 提示“试图加载格式不正确的程序”
+   请删除 EasyRecorder.exe 同目录下的 ScreenRecorderLib.dll 后再打开。
+
 
 【系统要求】
 ----------------------------------------

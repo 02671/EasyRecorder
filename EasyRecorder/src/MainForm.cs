@@ -207,7 +207,6 @@ public sealed class MainForm : Form
     {
         base.OnHandleCreated(e);
         NativeMethods.SetWindowDisplayAffinity(Handle, NativeMethods.WDA_EXCLUDEFROMCAPTURE);
-        TryExcludeFromCapture(Handle);
     }
 
     protected override void OnShown(EventArgs e)
@@ -220,20 +219,8 @@ public sealed class MainForm : Form
             PositionAtTop();
             Opacity = 1;
             NativeMethods.SetWindowDisplayAffinity(Handle, NativeMethods.WDA_EXCLUDEFROMCAPTURE);
-            TryExcludeFromCapture(Handle);
             ShowWelcomeOnce();
             _uiTimer.Start();
-        }
-    }
-
-    private static void TryExcludeFromCapture(IntPtr handle)
-    {
-        try
-        {
-            ScreenRecorderLib.Recorder.SetExcludeFromCapture(handle, true);
-        }
-        catch
-        {
         }
     }
 

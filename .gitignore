@@ -93,6 +93,7 @@ EasyRecorder/dist/*.exe
 *.out
 *.app
 *.dll
+!EasyRecorder/lib/ScreenRecorderLib.dll
 *.dylib
 *.so
 *.test

@@ -16,10 +16,10 @@
     <Authors>EasyRecorder Studio</Authors>
     <Description>简单好用的 Windows 录屏工具</Description>
     <Copyright>Copyright © 2026 EasyRecorder Studio</Copyright>
-    <Version>1.0.8</Version>
-    <AssemblyVersion>1.0.8.0</AssemblyVersion>
-    <FileVersion>1.0.8.0</FileVersion>
-    <InformationalVersion>1.0.8</InformationalVersion>
+    <Version>1.0.9</Version>
+    <AssemblyVersion>1.0.9.0</AssemblyVersion>
+    <FileVersion>1.0.9.0</FileVersion>
+    <InformationalVersion>1.0.9</InformationalVersion>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
     <NeutralLanguage>zh-Hans</NeutralLanguage>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
@@ -30,13 +30,17 @@
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <SelfContained>false</SelfContained>
     <PublishSingleFile>true</PublishSingleFile>
-    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <IncludeNativeLibrariesForSelfExtract>false</IncludeNativeLibrariesForSelfExtract>
     <DebugType>none</DebugType>
     <InvariantGlobalization>true</InvariantGlobalization>
     <PublishReadyToRun>false</PublishReadyToRun>
     <NoWarn>CA1416</NoWarn>
   </PropertyGroup>
   <ItemGroup>
-    <PackageReference Include="ScreenRecorderLib" Version="7.0.1" />
+    <Reference Include="ScreenRecorderLib">
+      <HintPath>lib\ScreenRecorderLib.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <EmbeddedResource Include="lib\ScreenRecorderLib.dll" LogicalName="EasyRecorder.ScreenRecorderLib.dll" />
   </ItemGroup>
 </Project>

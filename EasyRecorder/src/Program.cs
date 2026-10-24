@@ -7,6 +7,7 @@ internal static class Program
     [STAThread]
     private static void Main()
     {
+        NativeCapture.DeployLibrary();
         ApplicationConfiguration.Initialize();
         Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
         Application.ThreadException += (_, e) => ReportFatal(e.Exception);

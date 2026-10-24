@@ -66,6 +66,12 @@ public sealed class Recorder : IDisposable
             throw new InvalidOperationException(
                 "录制组件无法加载。请安装 Microsoft Visual C++ Redistributable（x64）后重试。");
         }
+        catch (BadImageFormatException)
+        {
+            ReleaseEngine();
+            throw new InvalidOperationException(
+                "录制组件位数不正确。请使用 64 位 EasyRecorder，并删除程序目录里旧的 ScreenRecorderLib.dll 后重试。");
+        }
         catch (Exception ex)
         {
             ReleaseEngine();

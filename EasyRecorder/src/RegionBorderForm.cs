@@ -17,22 +17,6 @@ public sealed class RegionBorderForm : Form
         Enabled = false;
     }
 
-    private void TryExcludeFromCapture()
-    {
-        if (!IsHandleCreated)
-        {
-            return;
-        }
-
-        try
-        {
-            ScreenRecorderLib.Recorder.SetExcludeFromCapture(Handle, true);
-        }
-        catch
-        {
-        }
-    }
-
     protected override bool ShowWithoutActivation => true;
 
     protected override CreateParams CreateParams
@@ -49,7 +33,6 @@ public sealed class RegionBorderForm : Form
     {
         base.OnHandleCreated(e);
         NativeMethods.SetWindowDisplayAffinity(Handle, NativeMethods.WDA_EXCLUDEFROMCAPTURE);
-        TryExcludeFromCapture();
     }
 
     public void ShowAround(Rectangle screenRect)
@@ -68,7 +51,6 @@ public sealed class RegionBorderForm : Form
         Region = new Region(path);
         old?.Dispose();
         NativeMethods.SetWindowDisplayAffinity(Handle, NativeMethods.WDA_EXCLUDEFROMCAPTURE);
-        TryExcludeFromCapture();
         if (!Visible)
         {
             Show();
