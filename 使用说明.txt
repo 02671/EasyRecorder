@@ -71,9 +71,15 @@ EasyRecorder 录屏工具 · 新手使用说明
 5. Windows N / KN 版无法录制
    请先安装对应系统的媒体功能包（Media Feature Pack）。
 
+6. 提示缺少 .NET，或双击后没有反应
+   请安装 .NET 8 Desktop Runtime（x64）：
+   https://dotnet.microsoft.com/en-us/download/dotnet/8.0
+
 
 【系统要求】
 ----------------------------------------
 - Windows 10 / Windows 11（64 位）
-- 无需安装 .NET，无需安装 FFmpeg
+- 需要已安装 .NET 8 Desktop Runtime（x64）：
+  https://dotnet.microsoft.com/en-us/download/dotnet/8.0
+- 无需安装 FFmpeg
 - 需要 Microsoft Visual C++ Redistributable（x64）

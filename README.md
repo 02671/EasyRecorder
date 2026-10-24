@@ -4,11 +4,11 @@
 
 ## 下载
 
-最新 Windows 版（64 位，双击即可运行）：
+最新 Windows 版（64 位）：
 
 https://github.com/02671/EasyRecorder/releases/latest
 
-双击 `EasyRecorder.exe` 即可使用，无需安装 FFmpeg。
+本机需已安装 [.NET 8 Desktop Runtime x64](https://dotnet.microsoft.com/en-us/download/dotnet/8.0)。双击 `EasyRecorder.exe` 即可使用，无需安装 FFmpeg。
 
 ## 使用
 
@@ -25,7 +25,7 @@ https://github.com/02671/EasyRecorder/releases/latest
 需要 .NET 8 SDK：
 
 ```bash
-dotnet publish EasyRecorder/EasyRecorder.csproj -c Release -r win-x64 -p:Platform=x64 --self-contained true -p:PublishSingleFile=true -p:EnableCompressionInSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o publish
+dotnet publish EasyRecorder/EasyRecorder.csproj -c Release -r win-x64 -p:Platform=x64 --self-contained false -p:PublishSingleFile=true -p:EnableCompressionInSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o publish
 ```
 
 输出文件：`publish/EasyRecorder.exe`

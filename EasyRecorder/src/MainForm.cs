@@ -108,7 +108,18 @@ public sealed class MainForm : Form
 
             try
             {
-                BeginInvoke(() => HandleRecordingFailed(message));
+                BeginInvoke(() =>
+                {
+                    if (!IsDisposed)
+                    {
+                        MessageBox.Show(
+                            this,
+                            message,
+                            "录制提示",
+                            MessageBoxButtons.OK,
+                            MessageBoxIcon.Information);
+                    }
+                });
             }
             catch
             {
@@ -117,29 +128,14 @@ public sealed class MainForm : Form
 
         _uiTimer.Tick += (_, _) =>
         {
-            TimeSpan elapsed = _recorder.Elapsed;
-            _timerLabel.Text = $"{(int)elapsed.TotalHours:00}:{elapsed.Minutes:00}:{elapsed.Seconds:00}";
+            if (_recorder.IsRecording)
+            {
+                TimeSpan elapsed = _recorder.Elapsed;
+                _timerLabel.Text = $"{(int)elapsed.TotalHours:00}:{elapsed.Minutes:00}:{elapsed.Seconds:00}";
+            }
         };
 
         SetIdleUi();
-    }
-
-    public void RestoreFromSecondInstance()
-    {
-        if (IsDisposed)
-        {
-            return;
-        }
-
-        if (WindowState == FormWindowState.Minimized)
-        {
-            WindowState = FormWindowState.Normal;
-        }
-
-        NativeMethods.ShowWindow(Handle, NativeMethods.SW_RESTORE);
-        Show();
-        Activate();
-        NativeMethods.SetForegroundWindow(Handle);
     }
 
     private void BuildLayout()
@@ -226,6 +222,7 @@ public sealed class MainForm : Form
             NativeMethods.SetWindowDisplayAffinity(Handle, NativeMethods.WDA_EXCLUDEFROMCAPTURE);
             TryExcludeFromCapture(Handle);
             ShowWelcomeOnce();
+            _uiTimer.Start();
         }
     }
 
@@ -378,22 +375,6 @@ public sealed class MainForm : Form
         }
     }
 
-    private void HandleRecordingFailed(string message)
-    {
-        if (IsDisposed || _saving)
-        {
-            return;
-        }
-
-        SetIdleUi();
-        MessageBox.Show(
-            this,
-            message,
-            "录制提示",
-            MessageBoxButtons.OK,
-            MessageBoxIcon.Information);
-    }
-
     private void PauseButton_Click(object? sender, EventArgs e)
     {
         if (!_recorder.IsRecording)
@@ -401,44 +382,19 @@ public sealed class MainForm : Form
             return;
         }
 
-        try
+        if (_recorder.IsPaused)
         {
-            if (_recorder.IsPaused)
-            {
-                _recorder.Resume();
-                _pauseButton.Text = "暂停";
-                _statusLabel.Text = "● 录制中";
-                _statusLabel.ForeColor = Color.FromArgb(255, 82, 82);
-            }
-            else
-            {
-                _recorder.Pause();
-                _pauseButton.Text = "继续";
-                _statusLabel.Text = "● 已暂停";
-                _statusLabel.ForeColor = Color.FromArgb(255, 183, 77);
-            }
+            _recorder.Resume();
+            _pauseButton.Text = "暂停";
+            _statusLabel.Text = "● 录制中";
+            _statusLabel.ForeColor = Color.FromArgb(255, 82, 82);
         }
-        catch (Exception ex)
+        else
         {
-            if (_recorder.IsPaused)
-            {
-                _pauseButton.Text = "继续";
-                _statusLabel.Text = "● 已暂停";
-                _statusLabel.ForeColor = Color.FromArgb(255, 183, 77);
-            }
-            else
-            {
-                _pauseButton.Text = "暂停";
-                _statusLabel.Text = "● 录制中";
-                _statusLabel.ForeColor = Color.FromArgb(255, 82, 82);
-            }
-
-            MessageBox.Show(
-                this,
-                ex.Message,
-                "录制提示",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Information);
+            _recorder.Pause();
+            _pauseButton.Text = "继续";
+            _statusLabel.Text = "● 已暂停";
+            _statusLabel.ForeColor = Color.FromArgb(255, 183, 77);
         }
     }
 
@@ -480,7 +436,7 @@ public sealed class MainForm : Form
         }
 
         _saving = true;
-        StopUiTimer();
+        _uiTimer.Stop();
         SetSavingUi(discard ? "● 正在取消" : "● 正在保存");
 
         string? path = null;
@@ -497,6 +453,7 @@ public sealed class MainForm : Form
         finally
         {
             _saving = false;
+            _uiTimer.Start();
             SetIdleUi();
         }
 
@@ -570,7 +527,6 @@ public sealed class MainForm : Form
         _statusLabel.Text = "● 未录制";
         _statusLabel.ForeColor = Color.FromArgb(160, 160, 160);
         _timerLabel.Text = "00:00:00";
-        StopUiTimer();
     }
 
     private void SetRecordingUi()
@@ -584,23 +540,6 @@ public sealed class MainForm : Form
         _pauseButton.Text = "暂停";
         _statusLabel.Text = "● 录制中";
         _statusLabel.ForeColor = Color.FromArgb(255, 82, 82);
-        StartUiTimer();
-    }
-
-    private void StartUiTimer()
-    {
-        if (!_uiTimer.Enabled)
-        {
-            _uiTimer.Start();
-        }
-    }
-
-    private void StopUiTimer()
-    {
-        if (_uiTimer.Enabled)
-        {
-            _uiTimer.Stop();
-        }
     }
 
     private void ClearSelectedRegion()
